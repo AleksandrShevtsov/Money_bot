@@ -1,0 +1,159 @@
+{
+  "balance": 540.0,
+  "positions": {
+    "BTC/USDT:USDT": {
+      "side": null,
+      "entry": null,
+      "qty": 0.0,
+      "margin": 0.0,
+      "stop": null,
+      "take": null
+    },
+    "ETH/USDT:USDT": {
+      "side": null,
+      "entry": null,
+      "qty": 0.0,
+      "margin": 0.0,
+      "stop": null,
+      "take": null
+    },
+    "SOL/USDT:USDT": {
+      "side": null,
+      "entry": null,
+      "qty": 0.0,
+      "margin": 0.0,
+      "stop": null,
+      "take": null
+    },
+    "BNB/USDT:USDT": {
+      "side": null,
+      "entry": null,
+      "qty": 0.0,
+      "margin": 0.0,
+      "stop": null,
+      "take": null
+    },
+    "XRP/USDT:USDT": {
+      "side": null,
+      "entry": null,
+      "qty": 0.0,
+      "margin": 0.0,
+      "stop": null,
+      "take": null
+    },
+    "ADA/USDT:USDT": {
+      "side": null,
+      "entry": null,
+      "qty": 0.0,
+      "margin": 0.0,
+      "stop": null,
+      "take": null
+    },
+    "DOGE/USDT:USDT": {
+      "side": null,
+      "entry": null,
+      "qty": 0.0,
+      "margin": 0.0,
+      "stop": null,
+      "take": null
+    },
+    "AVAX/USDT:USDT": {
+      "side": null,
+      "entry": null,
+      "qty": 0.0,
+      "margin": 0.0,
+      "stop": null,
+      "take": null
+    },
+    "LINK/USDT:USDT": {
+      "side": null,
+      "entry": null,
+      "qty": 0.0,
+      "margin": 0.0,
+      "stop": null,
+      "take": null
+    },
+    "WIF/USDT:USDT": {
+      "side": null,
+      "entry": null,
+      "qty": 0.0,
+      "margin": 0.0,
+      "stop": null,
+      "take": null
+    },
+    "DOT/USDT:USDT": {
+      "side": null,
+      "entry": null,
+      "qty": 0.0,
+      "margin": 0.0,
+      "stop": null,
+      "take": null
+    },
+    "ATOM/USDT:USDT": {
+      "side": null,
+      "entry": null,
+      "qty": 0.0,
+      "margin": 0.0,
+      "stop": null,
+      "take": null
+    },
+    "LTC/USDT:USDT": {
+      "side": null,
+      "entry": null,
+      "qty": 0.0,
+      "margin": 0.0,
+      "stop": null,
+      "take": null
+    },
+    "UNI/USDT:USDT": {
+      "side": null,
+      "entry": null,
+      "qty": 0.0,
+      "margin": 0.0,
+      "stop": null,
+      "take": null
+    },
+    "NEAR/USDT:USDT": {
+      "side": null,
+      "entry": null,
+      "qty": 0.0,
+      "margin": 0.0,
+      "stop": null,
+      "take": null
+    }
+  },
+  "cooldowns": {
+    "BTC/USDT:USDT": 517,
+    "ETH/USDT:USDT": 517,
+    "SOL/USDT:USDT": 517,
+    "BNB/USDT:USDT": 517,
+    "XRP/USDT:USDT": 516,
+    "ADA/USDT:USDT": 515,
+    "DOGE/USDT:USDT": 418,
+    "AVAX/USDT:USDT": 418,
+    "LINK/USDT:USDT": 418,
+    "WIF/USDT:USDT": 418,
+    "DOT/USDT:USDT": 418,
+    "ATOM/USDT:USDT": 418,
+    "LTC/USDT:USDT": 418,
+    "UNI/USDT:USDT": 417,
+    "NEAR/USDT:USDT": 417
+  },
+  "last_signals": {
+    "BTC/USDT:USDT": "HOLD",
+    "ETH/USDT:USDT": "HOLD",
+    "SOL/USDT:USDT": "HOLD",
+    "BNB/USDT:USDT": "HOLD",
+    "XRP/USDT:USDT": "HOLD",
+    "ADA/USDT:USDT": "HOLD",
+    "DOGE/USDT:USDT": "HOLD",
+    "AVAX/USDT:USDT": "HOLD",
+    "LINK/USDT:USDT": "HOLD",
+    "WIF/USDT:USDT": "HOLD",
+    "DOT/USDT:USDT": "HOLD",
+    "ATOM/USDT:USDT": "HOLD",
+    "LTC/USDT:USDT": "HOLD",
+    "UNI/USDT:USDT": "HOLD",
+    "NEAR/USDT:USDT": "HOLD"
+  }
+}

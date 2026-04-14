@@ -1,0 +1,4 @@
+[2026-04-06 20:12:36.433862] Runtime ERROR: bingx does not have market symbol MATIC/USDT:USDT
+[2026-04-06 20:13:53.373955] Runtime ERROR: bingx does not have market symbol MATIC/USDT:USDT
+[2026-04-06 20:15:08.316345] Runtime ERROR: bingx does not have market symbol MATIC/USDT:USDT
+[2026-04-06 20:16:27.166497] Runtime ERROR: bingx does not have market symbol MATIC/USDT:USDT

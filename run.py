@@ -1,0 +1,1 @@
+print("Bot skeleton – see previous message for full logic")
