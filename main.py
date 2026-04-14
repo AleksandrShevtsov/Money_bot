@@ -68,6 +68,7 @@ from config import (
     ENABLE_CHART_PATTERNS,
     CHART_PATTERN_LOOKBACK_4H,
     MAX_CHART_PATTERN_EXTENSION_PCT,
+    BTC_REGIME_CONFLICT_PENALTY,
 )
 from utils import log, log_green, log_red, log_yellow, log_cyan
 from exchange_momentum_scanner import ExchangeMomentumScanner
@@ -363,7 +364,18 @@ class SmartMomentumPaperBot:
     def count_open_positions(self):
         return sum(1 for pos in self.positions.values() if pos is not None)
 
-    def open_position(self, symbol, side, entry_price, score, reason, candles, signal_class="REJECT", strategy_meta=None):
+    def open_position(
+        self,
+        symbol,
+        side,
+        entry_price,
+        score,
+        reason,
+        candles,
+        signal_class="REJECT",
+        strategy_meta=None,
+        levels_candles=None,
+    ):
         if self.positions.get(symbol) is not None:
             return
 
@@ -385,6 +397,7 @@ class SmartMomentumPaperBot:
             score=score,
             candles=candles,
             signal_class=signal_class,
+            levels_candles=levels_candles,
         )
 
         pos["opened_at"] = time.time()
@@ -701,14 +714,17 @@ class SmartMomentumPaperBot:
         candles = fetch_klines(symbol, "15m", 200)
         if not candles:
             return
+        candles_1h = fetch_klines(symbol, "1h", 200) or []
         candles_4h = fetch_klines(symbol, "4h", 120) or []
 
         current_price = float(candles[-1]["close"])
 
-        structure = detect_market_structure(candles)
-        volume_confirmed, last_vol, avg_vol = breakout_volume_confirms(candles)
-        regime = market_regime(candles)
-        regime_name = regime.get("name", "range_day")
+        structure_4h = detect_market_structure(candles_4h)
+        structure_15m = detect_market_structure(candles)
+        volume_confirmed_4h, _, _ = breakout_volume_confirms(candles_4h)
+        volume_confirmed_15m, last_vol, avg_vol = breakout_volume_confirms(candles)
+        regime_4h = market_regime(candles_4h)
+        regime_name = regime_4h.get("name", "range_day")
         btc_regime = self._safe_detect("btc_regime", detect_btc_regime, default=None) if ENABLE_BTC_REGIME_FILTER else {
             "regime": "disabled",
             "bias": "NEUTRAL",
@@ -723,20 +739,25 @@ class SmartMomentumPaperBot:
                 "reason": "btc_regime_unavailable",
             }
 
-        breakout = detect_range_breakout(candles)
-        trendline = detect_trendline_breakout(candles)
+        breakout_4h = detect_range_breakout(candles_4h)
+        trendline_4h = detect_trendline_breakout(candles_4h)
+        retest_4h = None
+        if trendline_4h:
+            retest_4h = detect_retest_after_breakout(candles_4h, trendline_4h)
+        elif breakout_4h:
+            retest_4h = detect_retest_after_breakout(candles_4h, breakout_4h)
 
-        breakout_confirmation = breakout
-        trendline_confirmation = trendline
+        breakout_confirmation = detect_range_breakout(candles)
+        trendline_confirmation = detect_trendline_breakout(candles)
 
-        retest = None
+        retest_confirmation = None
         if trendline_confirmation:
-            retest = detect_retest_after_breakout(candles, trendline_confirmation)
+            retest_confirmation = detect_retest_after_breakout(candles, trendline_confirmation)
         elif breakout_confirmation:
-            retest = detect_retest_after_breakout(candles, breakout_confirmation)
+            retest_confirmation = detect_retest_after_breakout(candles, breakout_confirmation)
 
-        retest_confirmation = retest
-
+        fast_move_4h = detect_fast_move(candles_4h)
+        acceleration_4h = detect_price_acceleration(candles_4h)
         fast_move = detect_fast_move(candles)
         acceleration = detect_price_acceleration(candles)
 
@@ -754,7 +775,8 @@ class SmartMomentumPaperBot:
         else:
             symbol_profile = "ALT"
 
-        liquidity_sweep = self._safe_detect("liquidity_sweep", detect_liquidity_sweep, candles, default=None)
+        liquidity_sweep_4h = self._safe_detect("liquidity_sweep_4h", detect_liquidity_sweep, candles_4h, default=None)
+        liquidity_sweep = self._safe_detect("liquidity_sweep_15m", detect_liquidity_sweep, candles, default=None)
         breakout_multi_bar = bool(breakout_confirmation and multi_bar_breakout_confirmation(candles, breakout_confirmation))
         trendline_multi_bar = bool(trendline_confirmation and multi_bar_breakout_confirmation(candles, trendline_confirmation))
 
@@ -889,15 +911,30 @@ class SmartMomentumPaperBot:
             oi_now=oi_now,
             oi_prev=oi_prev,
             pattern=pattern,
-            breakout_confirmation=breakout_confirmation,
-            trendline_confirmation=trendline_confirmation,
-            retest_confirmation=retest_confirmation,
-            regime=regime,
-            liquidity_sweep=liquidity_sweep,
+            breakout_confirmation=breakout_4h,
+            trendline_confirmation=trendline_4h,
+            retest_confirmation=retest_4h,
+            regime=regime_4h,
+            liquidity_sweep=liquidity_sweep_4h,
             htf_trend=htf_trend,
-            structure=structure,
+            structure=structure_4h,
             symbol_profile=symbol_profile,
         )
+
+        if breakout_confirmation and sig.side != "HOLD" and breakout_confirmation["direction"] == sig.side:
+            sig.score = max(sig.score, 0.42)
+            sig.reason = f"{sig.reason}|{breakout_confirmation['reason']}"
+            sig.entry_price = breakout_confirmation.get("entry_price", sig.entry_price)
+
+        if trendline_confirmation and sig.side != "HOLD" and trendline_confirmation["direction"] == sig.side:
+            sig.score = max(sig.score, 0.42)
+            sig.reason = f"{sig.reason}|{trendline_confirmation['reason']}"
+            sig.entry_price = trendline_confirmation.get("entry_price", sig.entry_price)
+
+        if retest_confirmation and sig.side != "HOLD" and retest_confirmation["direction"] == sig.side:
+            sig.score = max(sig.score, 0.48)
+            sig.reason = f"{sig.reason}|{retest_confirmation['reason']}"
+            sig.entry_price = retest_confirmation["entry_price"]
 
         # fast_move/acceleration только усиливают подтвержденный сигнал
         if fast_move and sig.side != "HOLD" and fast_move["direction"] == sig.side:
@@ -1013,6 +1050,25 @@ class SmartMomentumPaperBot:
             sig.reason = f"{sig.reason}|{best_candidate['reason']}"
             sig.entry_price = best_candidate["entry_price"]
 
+        strong_reversal_context = bool(
+            (htf_reversal and htf_reversal.get("direction") == sig.side)
+            or (divergence_signal and divergence_signal.get("direction") == sig.side)
+            or (
+                chart_pattern
+                and chart_pattern.get("direction") == sig.side
+                and chart_pattern.get("pattern") in {
+                    "head_and_shoulders",
+                    "inverse_head_and_shoulders",
+                    "double_bottom",
+                    "double_top",
+                    "triple_bottom",
+                    "triple_top",
+                    "falling_wedge",
+                    "rising_wedge",
+                }
+            )
+        )
+
         # мягкий HTF penalty
         if htf_trend == "BULL" and sig.side == "SELL":
             sig.score = max(0.0, sig.score - 0.05)
@@ -1026,10 +1082,12 @@ class SmartMomentumPaperBot:
             sig.score = max(sig.score, min(0.78, sig.score + 0.04 + btc_regime["strength"] * 0.02))
             sig.reason = f"{sig.reason}|{btc_regime['reason']}"
         elif btc_regime["bias"] not in {"NEUTRAL", sig.side} and sig.side in {"BUY", "SELL"}:
-            sig.score = max(0.0, sig.score - 0.07)
+            penalty = BTC_REGIME_CONFLICT_PENALTY * (0.6 if strong_reversal_context else 1.0)
+            sig.score = max(0.0, sig.score - penalty)
             sig.reason = f"{sig.reason}|btc_regime_conflict"
 
-        structure_ok = structure_allows_side(structure, sig.side) if sig.side in ("BUY", "SELL") else False
+        volume_confirmed = volume_confirmed_15m or volume_confirmed_4h
+        structure_ok = structure_allows_side(structure_4h, sig.side) if sig.side in ("BUY", "SELL") else False
         base_15m_confirmed = bool(base_breakout and base_entry)
 
         signal_class, quality_reasons = classify_signal_quality(
@@ -1044,7 +1102,7 @@ class SmartMomentumPaperBot:
             volume_confirmed=volume_confirmed,
             structure_ok=structure_ok,
             regime_name=regime_name,
-            liquidity_sweep=liquidity_sweep,
+            liquidity_sweep=(liquidity_sweep if liquidity_sweep else liquidity_sweep_4h),
             multi_bar_confirmed=(breakout_multi_bar or trendline_multi_bar),
             base_breakout=(base_breakout if base_15m_confirmed else None),
             reversal_signal=htf_reversal,
@@ -1075,10 +1133,26 @@ class SmartMomentumPaperBot:
         if time.time() < self.cooldown_until.get(symbol, 0):
             return
 
+        local_entry_confirmed = any(
+            item is not None and item.get("direction") == sig.side
+            for item in [breakout_confirmation, trendline_confirmation, retest_confirmation, fast_move, acceleration]
+        )
+        specialized_entry_confirmed = (
+            (base_breakout is not None and base_entry is not None and base_breakout.get("direction") == sig.side)
+            or (htf_reversal is not None and reversal_entry is not None and htf_reversal.get("direction") == sig.side)
+            or (divergence_signal is not None and divergence_signal.get("direction") == sig.side)
+            or (order_block is not None and order_block_entry is not None and order_block.get("direction") == sig.side)
+            or (chart_pattern is not None and chart_pattern_entry is not None and chart_pattern.get("direction") == sig.side)
+        )
+
+        if sig.side in {"BUY", "SELL"} and not (local_entry_confirmed or specialized_entry_confirmed):
+            log_yellow(f"BLOCKED {symbol} | reason=no_15m_entry_confirmation")
+            return
+
         # дешёвые монеты: нужен хотя бы retest или сильный RR
         if LOW_PRICE_REQUIRES_RETEST:
             if is_low_price_coin(current_price, LOW_PRICE_COIN_THRESHOLD):
-                if sig.side == "BUY" and retest_confirmation is None:
+                if sig.side == "BUY" and retest_confirmation is None and base_entry is None and order_block_entry is None:
                     log_yellow(f"BLOCKED {symbol} | reason=low_price_requires_retest")
                     return
 
@@ -1118,6 +1192,7 @@ class SmartMomentumPaperBot:
                     score=sig.score,
                     candles=candles,
                     signal_class=sig.signal_class,
+                    levels_candles=candles_1h,
                 )
                 level_data = preview_pos.get("level_data")
                 if level_data:
@@ -1138,6 +1213,21 @@ class SmartMomentumPaperBot:
             )
             sig.signal_class = "B"
             sig.reason = f"{sig.reason}|reject_overridden_by_rr={rr_value:.2f}"
+
+        if order_block and order_block.get("direction") != sig.side and not strong_reversal_context:
+            if order_block.get("pattern") == "bullish_order_block" and sig.side == "SELL":
+                log_yellow(f"BLOCKED {symbol} | reason=against_bullish_order_block")
+                return
+            if order_block.get("pattern") == "bearish_order_block" and sig.side == "BUY":
+                log_yellow(f"BLOCKED {symbol} | reason=against_bearish_order_block")
+                return
+
+        if btc_regime["bias"] == "BUY" and sig.side == "SELL" and not strong_reversal_context and rr_value < HIGH_RR_OVERRIDE_THRESHOLD:
+            log_yellow(f"BLOCKED {symbol} | reason=btc_bullish_conflict")
+            return
+        if btc_regime["bias"] == "SELL" and sig.side == "BUY" and not strong_reversal_context and rr_value < HIGH_RR_OVERRIDE_THRESHOLD:
+            log_yellow(f"BLOCKED {symbol} | reason=btc_bearish_conflict")
+            return
 
         # для low-cap не пускаем C/REJECT без retest
         if symbol_profile == "LOW_CAP" and retest_confirmation is None and sig.signal_class not in {
@@ -1198,20 +1288,29 @@ class SmartMomentumPaperBot:
                 "btc_bias": btc_regime["bias"],
                 "htf_context": "|".join(
                     item for item in [
+                        breakout_4h["reason"] if breakout_4h else "",
+                        trendline_4h["reason"] if trendline_4h else "",
+                        retest_4h["reason"] if retest_4h else "",
                         base_breakout["pattern"] if base_breakout else "",
                         htf_reversal["pattern"] if htf_reversal else "",
                         divergence_signal["reason"] if divergence_signal else "",
                         order_block["pattern"] if order_block else "",
                         chart_pattern["pattern"] if chart_pattern else "",
+                        fast_move_4h["reason"] if fast_move_4h else "",
+                        acceleration_4h["reason"] if acceleration_4h else "",
                     ] if item
                 ),
                 "entry_context": "|".join(
                     item for item in [
+                        breakout_confirmation["reason"] if breakout_confirmation else "",
+                        trendline_confirmation["reason"] if trendline_confirmation else "",
+                        retest_confirmation["reason"] if retest_confirmation else "",
                         base_entry["reason"] if base_entry else "",
                         reversal_entry["reason"] if reversal_entry else "",
                         order_block_entry["reason"] if order_block_entry else "",
                         chart_pattern_entry["reason"] if chart_pattern_entry else "",
-                        retest_confirmation.get("reason") if retest_confirmation else "",
+                        fast_move["reason"] if fast_move else "",
+                        acceleration["reason"] if acceleration else "",
                     ] if item
                 ),
             }
@@ -1225,6 +1324,7 @@ class SmartMomentumPaperBot:
                 candles=candles,
                 signal_class=sig.signal_class,
                 strategy_meta=strategy_meta,
+                levels_candles=candles_1h,
             )
 
     def heartbeat(self):

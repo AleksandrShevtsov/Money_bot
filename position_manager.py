@@ -32,21 +32,34 @@ class PositionManager:
             return FIXED_LEVERAGE
         return self.dynamic_leverage(score)
 
-    def build_position(self, balance, side, price, sl_pct, tp_pct, score, candles=None, signal_class="REJECT"):
+    def build_position(
+        self,
+        balance,
+        side,
+        price,
+        sl_pct,
+        tp_pct,
+        score,
+        candles=None,
+        signal_class="REJECT",
+        levels_candles=None,
+    ):
         lev = self.get_leverage(score)
 
-        size_mult = signal_size_multiplier(score)
+        size_mult = signal_size_multiplier(score, signal_class=signal_class)
         margin = balance * self.entry_pct * size_mult
         notional = margin * lev
         qty = notional / price if price else 0.0
 
         level_data = None
 
-        if candles:
+        level_source_candles = levels_candles if levels_candles else candles
+
+        if level_source_candles:
             strict_level_data = calculate_sl_tp_from_levels(
                 side=side,
                 entry_price=price,
-                candles=candles,
+                candles=level_source_candles,
                 fallback_sl_pct=sl_pct,
                 fallback_tp_pct=tp_pct,
                 level_buffer_pct=0.001,
@@ -55,7 +68,7 @@ class PositionManager:
             soft_level_data = calculate_sl_tp_from_levels(
                 side=side,
                 entry_price=price,
-                candles=candles,
+                candles=level_source_candles,
                 fallback_sl_pct=sl_pct,
                 fallback_tp_pct=tp_pct,
                 level_buffer_pct=0.0015,

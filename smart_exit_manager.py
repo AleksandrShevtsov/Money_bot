@@ -103,7 +103,7 @@ class SmartExitManager:
         signal_class = pos.get("signal_class", "REJECT")
         score = pos.get("signal_score", 0.0)
 
-        if signal_class in {"A", "B"} or score >= self.strong_signal_score:
+        if signal_class in {"A", "B", "BASE_A", "REVERSAL_A", "REVERSAL_DIV", "OB_A", "PATTERN_A"} or score >= self.strong_signal_score:
             return self.strong_hold_seconds
 
         return self.min_hold_seconds

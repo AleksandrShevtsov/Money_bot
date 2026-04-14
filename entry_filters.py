@@ -1,3 +1,11 @@
+from config import (
+    STRONG_SIGNAL_SIZE_MULT,
+    B_SIGNAL_SIZE_MULT,
+    C_SIGNAL_SIZE_MULT,
+    REJECT_SIGNAL_SIZE_MULT,
+)
+
+
 def detect_recent_move_pct(candles, lookback=5):
     if candles is None or len(candles) < lookback:
         return 0.0
@@ -23,9 +31,18 @@ def blocked_by_anti_fomo(candles, side, lookback=5, max_move_pct=0.025):
     return False, move_pct
 
 
-def signal_size_multiplier(score):
+def signal_size_multiplier(score, signal_class="REJECT"):
+    if signal_class in {"A", "BASE_A", "REVERSAL_A", "REVERSAL_DIV", "OB_A", "PATTERN_A"}:
+        return STRONG_SIGNAL_SIZE_MULT
+    if signal_class == "B":
+        return B_SIGNAL_SIZE_MULT
+    if signal_class == "C":
+        return C_SIGNAL_SIZE_MULT
+    if signal_class == "REJECT":
+        return REJECT_SIGNAL_SIZE_MULT
+
     if score >= 0.80:
-        return 1.0
+        return STRONG_SIGNAL_SIZE_MULT
     if score >= 0.55:
-        return 0.75
-    return 0.5
+        return B_SIGNAL_SIZE_MULT
+    return C_SIGNAL_SIZE_MULT
