@@ -19,6 +19,8 @@ def classify_signal_quality(
     double_divergence=False,
     order_block_signal=None,
     order_block_confirmed=False,
+    chart_pattern_signal=None,
+    chart_pattern_confirmed=False,
 ):
     reasons = []
 
@@ -54,6 +56,10 @@ def classify_signal_quality(
         reasons.append("order_block")
     if order_block_confirmed:
         reasons.append("ob_retest")
+    if chart_pattern_signal and chart_pattern_signal.get("direction") == side:
+        reasons.append("chart_pattern")
+    if chart_pattern_confirmed:
+        reasons.append("pattern_15m")
 
     strong_htf = (
         (side == "BUY" and htf_trend == "BULL") or
@@ -77,6 +83,9 @@ def classify_signal_quality(
     if order_block_signal and order_block_confirmed and order_block_signal.get("direction") == side and score >= 0.56:
         return "OB_A", reasons
 
+    if chart_pattern_signal and chart_pattern_confirmed and chart_pattern_signal.get("direction") == side and score >= 0.57:
+        return "PATTERN_A", reasons
+
     if retest_confirmation and volume_confirmed and structure_ok and strong_htf and multi_bar_confirmed and score >= 0.40:
         return "A", reasons
 
@@ -90,7 +99,7 @@ def classify_signal_quality(
 
 
 def quality_position_multiplier(signal_class):
-    if signal_class in {"A", "BASE_A", "REVERSAL_A", "REVERSAL_DIV", "OB_A"}:
+    if signal_class in {"A", "BASE_A", "REVERSAL_A", "REVERSAL_DIV", "OB_A", "PATTERN_A"}:
         return 1.0
     if signal_class == "B":
         return 0.7

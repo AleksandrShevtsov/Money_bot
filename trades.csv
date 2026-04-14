@@ -1,0 +1,3 @@
+time,symbol,side,entry,exit,qty,pnl,result,reason,balance_after,signal_class,signal_score,rr_value,exit_type,btc_regime,symbol_profile,htf_context,entry_context
+2026-04-14 13:51:46,RAVEUSDT,SELL,14.24851,14.25891,13.685642,-0.142331,MINUS,stop_loss,101.841266,C,0.8,6.213324,stop_loss,bullish,ALT,rsi_divergence_mtf|bullish_order_block,
+2026-04-14 13:52:10,BLESSUSDT,SELL,0.018751,0.019046,2719.417548,-0.802228,MINUS,stop_loss,101.039038,B,0.27,34.518192,stop_loss,bullish,LOW_CAP,bullish_order_block,

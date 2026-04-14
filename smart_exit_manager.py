@@ -117,7 +117,7 @@ class SmartExitManager:
 
         signal_class = pos.get("signal_class", "REJECT")
         # A/B сделки не закрываем early-exit: ждём SL/TP/BE/trail
-        if signal_class in {"A", "B", "BASE_A", "REVERSAL_A", "REVERSAL_DIV", "OB_A"}:
+        if signal_class in {"A", "B", "BASE_A", "REVERSAL_A", "REVERSAL_DIV", "OB_A", "PATTERN_A"}:
             return False
 
         opened_at = pos.get("opened_at", 0)

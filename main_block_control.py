@@ -24,7 +24,7 @@ def apply_block_filters(
     extension_block=False,
     anti_fomo_block=False,
 ):
-    strong_signal = sig.signal_class in {"A", "BASE_A", "REVERSAL_A", "REVERSAL_DIV", "OB_A"}
+    strong_signal = sig.signal_class in {"A", "BASE_A", "REVERSAL_A", "REVERSAL_DIV", "OB_A", "PATTERN_A"}
 
     if sig.signal_class == "REJECT":
         if ENABLE_BLOCK_SIGNAL_CLASS_REJECT:

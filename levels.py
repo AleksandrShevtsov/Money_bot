@@ -79,6 +79,23 @@ def get_second_resistance(price, resistance_levels):
     return above[1] if len(above) > 1 else None
 
 
+def _ensure_distinct_tp2(side, entry_price, tp1, tp2, fallback_tp_pct):
+    min_gap_pct = max(fallback_tp_pct * 0.35, 0.006)
+
+    if side == "BUY":
+        min_tp2 = tp1 * (1 + min_gap_pct)
+        projected = tp1 + max(tp1 - entry_price, entry_price * fallback_tp_pct * 0.5)
+        if tp2 is None or tp2 <= tp1 * (1 + 0.001):
+            return max(min_tp2, projected)
+        return max(tp2, min_tp2)
+
+    min_tp2 = tp1 * (1 - min_gap_pct)
+    projected = tp1 - max(entry_price - tp1, entry_price * fallback_tp_pct * 0.5)
+    if tp2 is None or tp2 >= tp1 * (1 - 0.001):
+        return min(min_tp2, projected)
+    return min(tp2, min_tp2)
+
+
 def calculate_sl_tp_from_levels(
     side,
     entry_price,
@@ -105,7 +122,8 @@ def calculate_sl_tp_from_levels(
             if risk > 0 and reward > 0:
                 rr = reward / risk
                 if rr >= min_rr:
-                    tp2 = second_resistance * (1 - level_buffer_pct) if second_resistance is not None else take
+                    raw_tp2 = second_resistance * (1 - level_buffer_pct) if second_resistance is not None else None
+                    tp2 = _ensure_distinct_tp2("BUY", entry_price, take, raw_tp2, fallback_tp_pct)
                     return {
                         "stop": stop,
                         "take": take,
@@ -120,15 +138,16 @@ def calculate_sl_tp_from_levels(
 
         stop = entry_price * (1 - fallback_sl_pct)
         take = entry_price * (1 + fallback_tp_pct)
+        tp2 = _ensure_distinct_tp2("BUY", entry_price, take, None, fallback_tp_pct)
         rr = (take - entry_price) / max(1e-9, entry_price - stop)
         return {
             "stop": stop,
             "take": take,
             "tp1": take,
-            "tp2": take,
+            "tp2": tp2,
             "support": support,
             "resistance": resistance,
-            "liquidity_target": None,
+            "liquidity_target": tp2,
             "rr": rr,
             "source": "fallback",
         }
@@ -141,7 +160,8 @@ def calculate_sl_tp_from_levels(
         if risk > 0 and reward > 0:
             rr = reward / risk
             if rr >= min_rr:
-                tp2 = second_support * (1 + level_buffer_pct) if second_support is not None else take
+                raw_tp2 = second_support * (1 + level_buffer_pct) if second_support is not None else None
+                tp2 = _ensure_distinct_tp2("SELL", entry_price, take, raw_tp2, fallback_tp_pct)
                 return {
                     "stop": stop,
                     "take": take,
@@ -156,15 +176,16 @@ def calculate_sl_tp_from_levels(
 
     stop = entry_price * (1 + fallback_sl_pct)
     take = entry_price * (1 - fallback_tp_pct)
+    tp2 = _ensure_distinct_tp2("SELL", entry_price, take, None, fallback_tp_pct)
     rr = (entry_price - take) / max(1e-9, stop - entry_price)
     return {
         "stop": stop,
         "take": take,
         "tp1": take,
-        "tp2": take,
+        "tp2": tp2,
         "support": support,
         "resistance": resistance,
-        "liquidity_target": None,
+        "liquidity_target": tp2,
         "rr": rr,
         "source": "fallback",
     }

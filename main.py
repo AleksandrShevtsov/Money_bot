@@ -30,6 +30,9 @@ from config import (
     MAX_EXTENSION_FROM_LOCAL_LOW_PCT,
     MAX_EXTENSION_FROM_LOCAL_HIGH_PCT,
     TOP_SYMBOLS_COUNT,
+    TOP_VOLUME_SYMBOLS_COUNT,
+    TOP_GAINERS_COUNT,
+    TOP_LOSERS_COUNT,
     SCAN_INTERVAL_SECONDS,
     START_BALANCE_USDT,
     FIXED_MARGIN_PCT,
@@ -62,6 +65,9 @@ from config import (
     ENABLE_ORDER_BLOCK,
     ORDER_BLOCK_LOOKBACK,
     ENABLE_BTC_REGIME_FILTER,
+    ENABLE_CHART_PATTERNS,
+    CHART_PATTERN_LOOKBACK_4H,
+    MAX_CHART_PATTERN_EXTENSION_PCT,
 )
 from utils import log, log_green, log_red, log_yellow, log_cyan
 from exchange_momentum_scanner import ExchangeMomentumScanner
@@ -99,6 +105,11 @@ from reversal_detector import (
 )
 from btc_regime_filter import detect_btc_regime
 from order_block_detector import detect_order_block, confirm_order_block_retest
+from chart_pattern_detector import (
+    detect_best_chart_pattern,
+    confirm_chart_pattern_entry_15m,
+    chart_pattern_not_overextended,
+)
 
 
 class SmartMomentumPaperBot:
@@ -333,11 +344,18 @@ class SmartMomentumPaperBot:
             return False
 
     def update_symbols(self):
-        self.symbols = self.scanner.get_top_symbols(TOP_SYMBOLS_COUNT)
+        self.symbols = self.scanner.get_priority_symbols(
+            top_volume_n=TOP_VOLUME_SYMBOLS_COUNT,
+            top_gainers_n=TOP_GAINERS_COUNT,
+            top_losers_n=TOP_LOSERS_COUNT,
+        )
         self.configure_market_feed()
 
         log_cyan("UPDATED SYMBOL LIST:")
-        log_cyan(f"TOTAL SYMBOLS SELECTED - {len(self.symbols)} symbols")
+        log_cyan(
+            f"TOTAL SYMBOLS SELECTED - {len(self.symbols)} symbols | "
+            f"volume_top={TOP_VOLUME_SYMBOLS_COUNT} | gainers_top={TOP_GAINERS_COUNT} | losers_top={TOP_LOSERS_COUNT}"
+        )
         for s in self.symbols:
             self._empty_position_slot(s)
             print(" -", s)
@@ -839,6 +857,31 @@ class SmartMomentumPaperBot:
             default=None,
         ) if order_block else None
 
+        chart_pattern = self._safe_detect(
+            "chart_pattern_4h",
+            detect_best_chart_pattern,
+            candles_4h[-CHART_PATTERN_LOOKBACK_4H:] if candles_4h else candles_4h,
+            default=None,
+        ) if ENABLE_CHART_PATTERNS and candles_4h else None
+        chart_pattern_entry = self._safe_detect(
+            "chart_pattern_15m_confirm",
+            confirm_chart_pattern_entry_15m,
+            candles,
+            chart_pattern,
+            default=None,
+        ) if chart_pattern else None
+        if chart_pattern:
+            if (
+                chart_pattern_entry is None
+                or not chart_pattern_not_overextended(
+                    chart_pattern,
+                    current_price,
+                    max_extension_pct=MAX_CHART_PATTERN_EXTENSION_PCT,
+                )
+            ):
+                chart_pattern = None
+                chart_pattern_entry = None
+
         sig = build_signal(
             symbol=symbol,
             trades=trades,
@@ -949,6 +992,20 @@ class SmartMomentumPaperBot:
                 }
             )
 
+        if chart_pattern and chart_pattern_entry:
+            if sig.side == chart_pattern["direction"]:
+                sig.score = max(sig.score, max(0.58, float(chart_pattern["strength"])))
+                sig.reason = f"{sig.reason}|{chart_pattern['pattern']}|{chart_pattern_entry['reason']}"
+                sig.entry_price = chart_pattern_entry["entry_price"]
+            hold_candidates.append(
+                {
+                    "direction": chart_pattern["direction"],
+                    "entry_price": chart_pattern_entry["entry_price"],
+                    "strength": float(chart_pattern["strength"]),
+                    "reason": f"{chart_pattern['reason']}|{chart_pattern_entry['reason']}",
+                }
+            )
+
         if sig.side == "HOLD" and hold_candidates:
             best_candidate = max(hold_candidates, key=lambda item: item["strength"])
             sig.side = best_candidate["direction"]
@@ -996,6 +1053,8 @@ class SmartMomentumPaperBot:
             double_divergence=double_divergence_confirmed,
             order_block_signal=order_block,
             order_block_confirmed=bool(order_block_entry),
+            chart_pattern_signal=chart_pattern,
+            chart_pattern_confirmed=bool(chart_pattern_entry),
         )
 
         sig.signal_class = signal_class
@@ -1082,7 +1141,7 @@ class SmartMomentumPaperBot:
 
         # для low-cap не пускаем C/REJECT без retest
         if symbol_profile == "LOW_CAP" and retest_confirmation is None and sig.signal_class not in {
-            "A", "B", "BASE_A", "REVERSAL_A", "REVERSAL_DIV", "OB_A"
+            "A", "B", "BASE_A", "REVERSAL_A", "REVERSAL_DIV", "OB_A", "PATTERN_A"
         }:
             log_yellow(f"BLOCKED {symbol} | reason=low_cap_needs_better_context")
             return
@@ -1104,7 +1163,7 @@ class SmartMomentumPaperBot:
                 symbol_profile in {"ALT", "LOW_CAP"}
                 and liquidity_sweep is None
                 and retest_confirmation is None
-                and sig.signal_class not in {"A", "BASE_A", "REVERSAL_A", "REVERSAL_DIV", "OB_A"}
+                and sig.signal_class not in {"A", "BASE_A", "REVERSAL_A", "REVERSAL_DIV", "OB_A", "PATTERN_A"}
             ),
             oi_ready=(oi_data is not None),
             htf_conflict=(btc_regime["bias"] not in {"NEUTRAL", sig.side} and btc_regime["strength"] >= 0.8),
@@ -1143,6 +1202,7 @@ class SmartMomentumPaperBot:
                         htf_reversal["pattern"] if htf_reversal else "",
                         divergence_signal["reason"] if divergence_signal else "",
                         order_block["pattern"] if order_block else "",
+                        chart_pattern["pattern"] if chart_pattern else "",
                     ] if item
                 ),
                 "entry_context": "|".join(
@@ -1150,6 +1210,7 @@ class SmartMomentumPaperBot:
                         base_entry["reason"] if base_entry else "",
                         reversal_entry["reason"] if reversal_entry else "",
                         order_block_entry["reason"] if order_block_entry else "",
+                        chart_pattern_entry["reason"] if chart_pattern_entry else "",
                         retest_confirmation.get("reason") if retest_confirmation else "",
                     ] if item
                 ),
