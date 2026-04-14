@@ -5,6 +5,7 @@ class SmartExitManager:
         self.partial_close_fraction = 0.50
         self.trail_trigger = 0.85
         self.trail_gap_pct = 0.006
+        self.atr_trail_mult = 1.6
 
         self.min_hold_seconds = 180
         self.strong_hold_seconds = 900
@@ -68,6 +69,12 @@ class SmartExitManager:
     def should_partial_close(self, pos, price):
         if pos.get("partial_done"):
             return False
+        tp1 = pos.get("tp1")
+        if tp1 is not None:
+            if pos["side"] == "BUY" and price >= tp1:
+                return True
+            if pos["side"] == "SELL" and price <= tp1:
+                return True
         return self.progress_to_take(pos, price) >= self.partial_tp_trigger
 
     def get_partial_fraction(self):
@@ -81,12 +88,13 @@ class SmartExitManager:
 
     def apply_trailing(self, pos, price):
         old_stop = pos["stop"]
+        atr_gap_pct = max(self.trail_gap_pct, float(pos.get("atr_pct", 0.0)) * self.atr_trail_mult)
 
         if pos["side"] == "BUY":
-            new_stop = price * (1 - self.trail_gap_pct)
+            new_stop = price * (1 - atr_gap_pct)
             pos["stop"] = max(old_stop, new_stop, pos["entry"])
         else:
-            new_stop = price * (1 + self.trail_gap_pct)
+            new_stop = price * (1 + atr_gap_pct)
             pos["stop"] = min(old_stop, new_stop, pos["entry"])
 
         return old_stop, pos["stop"]
@@ -109,7 +117,7 @@ class SmartExitManager:
 
         signal_class = pos.get("signal_class", "REJECT")
         # A/B сделки не закрываем early-exit: ждём SL/TP/BE/trail
-        if signal_class in {"A", "B"}:
+        if signal_class in {"A", "B", "BASE_A", "REVERSAL_A", "REVERSAL_DIV", "OB_A"}:
             return False
 
         opened_at = pos.get("opened_at", 0)

@@ -49,6 +49,19 @@ from config import (
     MAX_SILENCE_SECONDS,
     ALLOW_REJECT_IF_HIGH_RR,
     HIGH_RR_OVERRIDE_THRESHOLD,
+    RSI_DIVERGENCE_ENABLED,
+    MACD_DIVERGENCE_ENABLED,
+    ENABLE_BASE_BREAKOUT,
+    BASE_LOOKBACK_4H,
+    BASE_VOLUME_MULTIPLIER,
+    BASE_MAX_MOVE_FROM_RANGE,
+    ENABLE_HTF_REVERSAL,
+    REVERSAL_LOOKBACK_4H,
+    REVERSAL_VOLUME_MULTIPLIER,
+    MAX_REVERSAL_EXTENSION_PCT,
+    ENABLE_ORDER_BLOCK,
+    ORDER_BLOCK_LOOKBACK,
+    ENABLE_BTC_REGIME_FILTER,
 )
 from utils import log, log_green, log_red, log_yellow, log_cyan
 from exchange_momentum_scanner import ExchangeMomentumScanner
@@ -72,6 +85,20 @@ from oi_context import classify_oi_price_context
 from liquidity_levels import build_volume_profile, nearest_level, detect_liquidity_sweep, is_false_breakout
 from time_filters import trading_window_allows_entry
 from confirmation_filters import multi_bar_breakout_confirmation
+from divergence_detector import (
+    detect_double_divergence,
+    detect_macd_divergence,
+    detect_rsi_divergence,
+    divergence_not_overextended,
+)
+from base_breakout_detector import detect_base_breakout, not_overextended_from_base, confirm_base_breakout_entry_15m
+from reversal_detector import (
+    confirm_reversal_entry_15m,
+    detect_htf_reversal,
+    reversal_not_overextended,
+)
+from btc_regime_filter import detect_btc_regime
+from order_block_detector import detect_order_block, confirm_order_block_retest
 
 
 class SmartMomentumPaperBot:
@@ -157,6 +184,25 @@ class SmartMomentumPaperBot:
         if symbol in {"BTCUSDT", "ETHUSDT"}:
             return "CORE"
         return "ALT"
+
+    def _safe_detect(self, label, fn, *args, default=None, **kwargs):
+        try:
+            return fn(*args, **kwargs)
+        except Exception as e:
+            log_yellow(f"DETECT FAIL {label} | error={e}")
+            return default
+
+    def _trade_log_meta(self, pos, exit_type):
+        return {
+            "signal_class": pos.get("signal_class", ""),
+            "signal_score": float(pos.get("signal_score", 0.0) or 0.0),
+            "rr_value": float(pos.get("rr_value", 0.0) or 0.0),
+            "exit_type": exit_type,
+            "btc_regime": pos.get("btc_regime", ""),
+            "symbol_profile": pos.get("symbol_profile", ""),
+            "htf_context": pos.get("htf_context", ""),
+            "entry_context": pos.get("entry_context", ""),
+        }
 
     def check_integrations(self):
         tg_result = self.notifier.test_connection()
@@ -320,6 +366,7 @@ class SmartMomentumPaperBot:
             tp_pct=TAKE_PROFIT_PCT,
             score=score,
             candles=candles,
+            signal_class=signal_class,
         )
 
         pos["opened_at"] = time.time()
@@ -336,7 +383,7 @@ class SmartMomentumPaperBot:
             f"notional={pos.get('notional', 0.0):.2f} | "
             f"margin={pos.get('margin', 0.0):.2f} | "
             f"qty={pos['qty']:.4f} | lev=x{pos['leverage']} | "
-            f"SL={pos['stop']:.4f} | TP={pos['take']:.4f}"
+            f"SL={pos['stop']:.4f} | TP1={pos.get('tp1', pos['take']):.4f} | TP2={pos.get('tp2', pos['take']):.4f}"
         )
 
         risk = abs(pos["entry"] - pos["stop"]) * pos["qty"]
@@ -348,7 +395,8 @@ class SmartMomentumPaperBot:
             f"Side: {side}\n"
             f"Entry: {pos['entry']:.6f}\n"
             f"SL: {pos['stop']:.6f}\n"
-            f"TP: {pos['take']:.6f}\n"
+            f"TP1: {pos.get('tp1', pos['take']):.6f}\n"
+            f"TP2: {pos.get('tp2', pos['take']):.6f}\n"
             f"Qty: {pos['qty']:.4f}\n"
             f"Lev: x{pos['leverage']}\n"
             f"Notional: {pos.get('notional', 0.0):.2f} USDT\n"
@@ -398,6 +446,7 @@ class SmartMomentumPaperBot:
             pnl = (pos["entry"] - price) * pos["qty"]
 
         self.balance += pnl
+        trade_meta = self._trade_log_meta(pos, reason)
 
         append_trade(
             symbol=symbol,
@@ -408,6 +457,14 @@ class SmartMomentumPaperBot:
             pnl=pnl,
             reason=reason,
             balance_after=self.balance,
+            signal_class=trade_meta["signal_class"],
+            signal_score=trade_meta["signal_score"],
+            rr_value=trade_meta["rr_value"],
+            exit_type=trade_meta["exit_type"],
+            btc_regime=trade_meta["btc_regime"],
+            symbol_profile=trade_meta["symbol_profile"],
+            htf_context=trade_meta["htf_context"],
+            entry_context=trade_meta["entry_context"],
         )
 
         result = "PLUS" if pnl >= 0 else "MINUS"
@@ -463,6 +520,7 @@ class SmartMomentumPaperBot:
             pnl = (pos["entry"] - price) * qty_close
 
         self.balance += pnl
+        trade_meta = self._trade_log_meta(pos, "partial_close")
 
         append_trade(
             symbol=symbol,
@@ -473,6 +531,14 @@ class SmartMomentumPaperBot:
             pnl=pnl,
             reason="partial_close",
             balance_after=self.balance,
+            signal_class=trade_meta["signal_class"],
+            signal_score=trade_meta["signal_score"],
+            rr_value=trade_meta["rr_value"],
+            exit_type=trade_meta["exit_type"],
+            btc_regime=trade_meta["btc_regime"],
+            symbol_profile=trade_meta["symbol_profile"],
+            htf_context=trade_meta["htf_context"],
+            entry_context=trade_meta["entry_context"],
         )
 
         pos["qty"] = qty_left
@@ -617,11 +683,27 @@ class SmartMomentumPaperBot:
         candles = fetch_klines(symbol, "15m", 200)
         if not candles:
             return
+        candles_4h = fetch_klines(symbol, "4h", 120) or []
 
-        current_price = candles[-1]["close"]
+        current_price = float(candles[-1]["close"])
 
         structure = detect_market_structure(candles)
         volume_confirmed, last_vol, avg_vol = breakout_volume_confirms(candles)
+        regime = market_regime(candles)
+        regime_name = regime.get("name", "range_day")
+        btc_regime = self._safe_detect("btc_regime", detect_btc_regime, default=None) if ENABLE_BTC_REGIME_FILTER else {
+            "regime": "disabled",
+            "bias": "NEUTRAL",
+            "strength": 0.0,
+            "reason": "btc_regime_disabled",
+        }
+        if not btc_regime:
+            btc_regime = {
+                "regime": "unknown",
+                "bias": "NEUTRAL",
+                "strength": 0.0,
+                "reason": "btc_regime_unavailable",
+            }
 
         breakout = detect_range_breakout(candles)
         trendline = detect_trendline_breakout(candles)
@@ -647,8 +729,6 @@ class SmartMomentumPaperBot:
         oi_prev = None
         oi_data = None
 
-        regime = "range_day"
-
         if symbol in {"BTCUSDT", "ETHUSDT", "SOLUSDT"}:
             symbol_profile = "CORE"
         elif current_price < 0.10:
@@ -656,9 +736,108 @@ class SmartMomentumPaperBot:
         else:
             symbol_profile = "ALT"
 
-        liquidity_sweep = None
-        breakout_multi_bar = False
-        trendline_multi_bar = False
+        liquidity_sweep = self._safe_detect("liquidity_sweep", detect_liquidity_sweep, candles, default=None)
+        breakout_multi_bar = bool(breakout_confirmation and multi_bar_breakout_confirmation(candles, breakout_confirmation))
+        trendline_multi_bar = bool(trendline_confirmation and multi_bar_breakout_confirmation(candles, trendline_confirmation))
+
+        base_breakout = None
+        base_entry = None
+        if ENABLE_BASE_BREAKOUT and candles_4h:
+            base_breakout = self._safe_detect(
+                "base_breakout",
+                detect_base_breakout,
+                candles_4h,
+                lookback=BASE_LOOKBACK_4H,
+                volume_mult=BASE_VOLUME_MULTIPLIER,
+                default=None,
+            )
+            if base_breakout and not not_overextended_from_base(
+                base_breakout,
+                current_price,
+                max_move_from_base=BASE_MAX_MOVE_FROM_RANGE,
+            ):
+                base_breakout = None
+            if base_breakout:
+                base_entry = self._safe_detect(
+                    "base_breakout_15m_confirm",
+                    confirm_base_breakout_entry_15m,
+                    candles,
+                    base_breakout,
+                    default=None,
+                )
+                if base_entry is None:
+                    base_breakout = None
+
+        htf_reversal = None
+        reversal_entry = None
+        if ENABLE_HTF_REVERSAL and candles_4h:
+            htf_reversal = self._safe_detect(
+                "htf_reversal",
+                detect_htf_reversal,
+                candles_4h,
+                lookback=REVERSAL_LOOKBACK_4H,
+                volume_mult=REVERSAL_VOLUME_MULTIPLIER,
+                default=None,
+            )
+            if htf_reversal:
+                reversal_entry = self._safe_detect(
+                    "reversal_entry_15m",
+                    confirm_reversal_entry_15m,
+                    candles,
+                    htf_reversal,
+                    default=None,
+                )
+                if (
+                    reversal_entry is None
+                    or not reversal_not_overextended(
+                        htf_reversal,
+                        current_price,
+                        max_extension_pct=MAX_REVERSAL_EXTENSION_PCT,
+                    )
+                ):
+                    htf_reversal = None
+                    reversal_entry = None
+
+        rsi_div_4h = self._safe_detect("rsi_div_4h", detect_rsi_divergence, candles_4h, default=None) if RSI_DIVERGENCE_ENABLED and candles_4h else None
+        macd_div_4h = self._safe_detect("macd_div_4h", detect_macd_divergence, candles_4h, default=None) if MACD_DIVERGENCE_ENABLED and candles_4h else None
+        double_div_4h = self._safe_detect("double_div_4h", detect_double_divergence, candles_4h, default=None) if candles_4h else None
+        rsi_div_15m = self._safe_detect("rsi_div_15m", detect_rsi_divergence, candles, default=None) if RSI_DIVERGENCE_ENABLED else None
+        macd_div_15m = self._safe_detect("macd_div_15m", detect_macd_divergence, candles, default=None) if MACD_DIVERGENCE_ENABLED else None
+        double_div_15m = self._safe_detect("double_div_15m", detect_double_divergence, candles, default=None)
+
+        if rsi_div_4h and not divergence_not_overextended(
+            candles,
+            rsi_div_4h["direction"],
+            pivot_index=rsi_div_15m.get("pivot_index") if rsi_div_15m else rsi_div_4h.get("pivot_index"),
+        ):
+            rsi_div_4h = None
+        if macd_div_4h and not divergence_not_overextended(
+            candles,
+            macd_div_4h["direction"],
+            pivot_index=macd_div_15m.get("pivot_index") if macd_div_15m else macd_div_4h.get("pivot_index"),
+        ):
+            macd_div_4h = None
+        if double_div_4h and not divergence_not_overextended(
+            candles,
+            double_div_4h["direction"],
+            pivot_index=double_div_15m.get("pivot_index") if double_div_15m else double_div_4h.get("pivot_index"),
+        ):
+            double_div_4h = None
+
+        order_block = self._safe_detect(
+            "order_block",
+            detect_order_block,
+            candles_4h,
+            lookback=ORDER_BLOCK_LOOKBACK,
+            default=None,
+        ) if ENABLE_ORDER_BLOCK and candles_4h else None
+        order_block_entry = self._safe_detect(
+            "order_block_retest",
+            confirm_order_block_retest,
+            candles,
+            order_block,
+            default=None,
+        ) if order_block else None
 
         sig = build_signal(
             symbol=symbol,
@@ -670,6 +849,11 @@ class SmartMomentumPaperBot:
             breakout_confirmation=breakout_confirmation,
             trendline_confirmation=trendline_confirmation,
             retest_confirmation=retest_confirmation,
+            regime=regime,
+            liquidity_sweep=liquidity_sweep,
+            htf_trend=htf_trend,
+            structure=structure,
+            symbol_profile=symbol_profile,
         )
 
         # fast_move/acceleration только усиливают подтвержденный сигнал
@@ -683,6 +867,95 @@ class SmartMomentumPaperBot:
 
         sig.side = self.invert_side_if_needed(sig.side)
 
+        hold_candidates = []
+
+        if base_breakout:
+            if sig.side == base_breakout["direction"]:
+                sig.score = max(sig.score, max(0.55, float(base_breakout["strength"])))
+                sig.reason = f"{sig.reason}|base_breakout_trigger|{base_entry['reason']}"
+                sig.entry_price = base_entry["entry_price"]
+            hold_candidates.append(
+                {
+                    "direction": base_breakout["direction"],
+                    "entry_price": base_entry["entry_price"],
+                    "strength": float(base_breakout["strength"]),
+                    "reason": f"{base_breakout['reason']}|{base_entry['reason']}",
+                }
+            )
+
+        if htf_reversal and reversal_entry:
+            if sig.side == htf_reversal["direction"]:
+                sig.score = max(sig.score, max(0.58, float(htf_reversal["strength"])))
+                sig.reason = f"{sig.reason}|{htf_reversal['pattern']}|{reversal_entry['reason']}"
+                sig.entry_price = reversal_entry["entry_price"]
+            hold_candidates.append(
+                {
+                    "direction": htf_reversal["direction"],
+                    "entry_price": reversal_entry["entry_price"],
+                    "strength": float(htf_reversal["strength"]),
+                    "reason": f"{htf_reversal['reason']}|{reversal_entry['reason']}",
+                }
+            )
+
+        divergence_candidates = []
+        if double_div_4h and double_div_15m and double_div_4h["direction"] == double_div_15m["direction"]:
+            divergence_candidates.append(
+                {
+                    "direction": double_div_4h["direction"],
+                    "entry_price": current_price,
+                    "strength": max(0.72, double_div_4h["strength"], double_div_15m["strength"]),
+                    "reason": "double_divergence_confirmed",
+                }
+            )
+        if rsi_div_4h and rsi_div_15m and rsi_div_4h["direction"] == rsi_div_15m["direction"]:
+            divergence_candidates.append(
+                {
+                    "direction": rsi_div_4h["direction"],
+                    "entry_price": current_price,
+                    "strength": max(0.60, rsi_div_4h["strength"], rsi_div_15m["strength"]),
+                    "reason": "rsi_divergence_mtf",
+                }
+            )
+        if macd_div_4h and macd_div_15m and macd_div_4h["direction"] == macd_div_15m["direction"]:
+            divergence_candidates.append(
+                {
+                    "direction": macd_div_4h["direction"],
+                    "entry_price": current_price,
+                    "strength": max(0.60, macd_div_4h["strength"], macd_div_15m["strength"]),
+                    "reason": "macd_divergence_mtf",
+                }
+            )
+
+        divergence_signal = max(divergence_candidates, key=lambda item: item["strength"]) if divergence_candidates else None
+        double_divergence_confirmed = any(item["reason"] == "double_divergence_confirmed" for item in divergence_candidates)
+        if divergence_signal:
+            if sig.side == divergence_signal["direction"]:
+                sig.score = max(sig.score, divergence_signal["strength"])
+                sig.reason = f"{sig.reason}|{divergence_signal['reason']}"
+                sig.entry_price = divergence_signal["entry_price"]
+            hold_candidates.append(divergence_signal)
+
+        if order_block and order_block_entry:
+            if sig.side == order_block["direction"]:
+                sig.score = max(sig.score, max(0.57, float(order_block["strength"])))
+                sig.reason = f"{sig.reason}|{order_block['pattern']}|{order_block_entry['reason']}"
+                sig.entry_price = order_block_entry["entry_price"]
+            hold_candidates.append(
+                {
+                    "direction": order_block["direction"],
+                    "entry_price": order_block_entry["entry_price"],
+                    "strength": float(order_block["strength"]),
+                    "reason": f"{order_block['reason']}|{order_block_entry['reason']}",
+                }
+            )
+
+        if sig.side == "HOLD" and hold_candidates:
+            best_candidate = max(hold_candidates, key=lambda item: item["strength"])
+            sig.side = best_candidate["direction"]
+            sig.score = max(sig.score, best_candidate["strength"])
+            sig.reason = f"{sig.reason}|{best_candidate['reason']}"
+            sig.entry_price = best_candidate["entry_price"]
+
         # мягкий HTF penalty
         if htf_trend == "BULL" and sig.side == "SELL":
             sig.score = max(0.0, sig.score - 0.05)
@@ -692,7 +965,15 @@ class SmartMomentumPaperBot:
             sig.score = max(0.0, sig.score - 0.05)
             sig.reason = f"{sig.reason}|soft_htf_bear_penalty"
 
+        if btc_regime["bias"] == sig.side and sig.side in {"BUY", "SELL"}:
+            sig.score = max(sig.score, min(0.78, sig.score + 0.04 + btc_regime["strength"] * 0.02))
+            sig.reason = f"{sig.reason}|{btc_regime['reason']}"
+        elif btc_regime["bias"] not in {"NEUTRAL", sig.side} and sig.side in {"BUY", "SELL"}:
+            sig.score = max(0.0, sig.score - 0.07)
+            sig.reason = f"{sig.reason}|btc_regime_conflict"
+
         structure_ok = structure_allows_side(structure, sig.side) if sig.side in ("BUY", "SELL") else False
+        base_15m_confirmed = bool(base_breakout and base_entry)
 
         signal_class, quality_reasons = classify_signal_quality(
             side=sig.side,
@@ -705,6 +986,16 @@ class SmartMomentumPaperBot:
             htf_trend=htf_trend,
             volume_confirmed=volume_confirmed,
             structure_ok=structure_ok,
+            regime_name=regime_name,
+            liquidity_sweep=liquidity_sweep,
+            multi_bar_confirmed=(breakout_multi_bar or trendline_multi_bar),
+            base_breakout=(base_breakout if base_15m_confirmed else None),
+            reversal_signal=htf_reversal,
+            reversal_confirmed=bool(reversal_entry),
+            divergence_signal=divergence_signal,
+            double_divergence=double_divergence_confirmed,
+            order_block_signal=order_block,
+            order_block_confirmed=bool(order_block_entry),
         )
 
         sig.signal_class = signal_class
@@ -713,7 +1004,7 @@ class SmartMomentumPaperBot:
         if self.last_signal.get(symbol) != sig.side:
             log(
                 f"{symbol} signal {self.last_signal.get(symbol, 'NONE')} -> {sig.side} | "
-                f"trend={htf_trend} | regime={regime} | class={sig.signal_class} | "
+                f"trend={htf_trend} | regime={regime_name} | btc={btc_regime['regime']} | class={sig.signal_class} | "
                 f"score={sig.score:.3f} | reason={sig.reason}"
             )
             self.last_signal[symbol] = sig.side
@@ -757,23 +1048,25 @@ class SmartMomentumPaperBot:
         level_data = None
         rr_value = 0.0
 
-        try:
-            preview_pos = self.position_manager.build_position(
-                balance=self.balance,
-                side=sig.side,
-                price=(sig.entry_price if sig.entry_price else current_price),
-                sl_pct=STOP_LOSS_PCT,
-                tp_pct=TAKE_PROFIT_PCT,
-                score=sig.score,
-                candles=candles,
-            )
-            level_data = preview_pos.get("level_data")
-            if level_data:
-                rr_value = float(level_data.get("rr", 0.0))
-        except Exception as e:
-            log_yellow(f"RR PREVIEW FAIL {symbol} | error={e}")
-            level_data = None
-            rr_value = 0.0
+        if sig.side in {"BUY", "SELL"}:
+            try:
+                preview_pos = self.position_manager.build_position(
+                    balance=self.balance,
+                    side=sig.side,
+                    price=(sig.entry_price if sig.entry_price else current_price),
+                    sl_pct=STOP_LOSS_PCT,
+                    tp_pct=TAKE_PROFIT_PCT,
+                    score=sig.score,
+                    candles=candles,
+                    signal_class=sig.signal_class,
+                )
+                level_data = preview_pos.get("level_data")
+                if level_data:
+                    rr_value = float(level_data.get("rr", 0.0))
+            except Exception as e:
+                log_yellow(f"RR PREVIEW FAIL {symbol} | error={e}")
+                level_data = None
+                rr_value = 0.0
 
         # если сигнал формально слабый, но RR высокий — разрешаем
         if (
@@ -788,7 +1081,9 @@ class SmartMomentumPaperBot:
             sig.reason = f"{sig.reason}|reject_overridden_by_rr={rr_value:.2f}"
 
         # для low-cap не пускаем C/REJECT без retest
-        if symbol_profile == "LOW_CAP" and retest_confirmation is None and sig.signal_class not in {"A", "B"}:
+        if symbol_profile == "LOW_CAP" and retest_confirmation is None and sig.signal_class not in {
+            "A", "B", "BASE_A", "REVERSAL_A", "REVERSAL_DIV", "OB_A"
+        }:
             log_yellow(f"BLOCKED {symbol} | reason=low_cap_needs_better_context")
             return
 
@@ -804,15 +1099,15 @@ class SmartMomentumPaperBot:
             sig,
             structure_ok=structure_ok,
             volume_confirmed=volume_confirmed,
-            panic_regime=(regime == "high_volatility_panic"),
+            panic_regime=(regime_name == "high_volatility_panic" or btc_regime["regime"] == "panic"),
             reclaim_needed=(
                 symbol_profile in {"ALT", "LOW_CAP"}
                 and liquidity_sweep is None
                 and retest_confirmation is None
-                and sig.signal_class != "A"
+                and sig.signal_class not in {"A", "BASE_A", "REVERSAL_A", "REVERSAL_DIV", "OB_A"}
             ),
             oi_ready=(oi_data is not None),
-            htf_conflict=False,
+            htf_conflict=(btc_regime["bias"] not in {"NEUTRAL", sig.side} and btc_regime["strength"] >= 0.8),
             extension_block=blocked_ext,
             anti_fomo_block=blocked,
         )
@@ -840,6 +1135,24 @@ class SmartMomentumPaperBot:
             strategy_meta = {
                 "rr_value": rr_value,
                 "symbol_profile": symbol_profile,
+                "btc_regime": btc_regime["regime"],
+                "btc_bias": btc_regime["bias"],
+                "htf_context": "|".join(
+                    item for item in [
+                        base_breakout["pattern"] if base_breakout else "",
+                        htf_reversal["pattern"] if htf_reversal else "",
+                        divergence_signal["reason"] if divergence_signal else "",
+                        order_block["pattern"] if order_block else "",
+                    ] if item
+                ),
+                "entry_context": "|".join(
+                    item for item in [
+                        base_entry["reason"] if base_entry else "",
+                        reversal_entry["reason"] if reversal_entry else "",
+                        order_block_entry["reason"] if order_block_entry else "",
+                        retest_confirmation.get("reason") if retest_confirmation else "",
+                    ] if item
+                ),
             }
 
             self.open_position(

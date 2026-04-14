@@ -24,13 +24,14 @@ def apply_block_filters(
     extension_block=False,
     anti_fomo_block=False,
 ):
+    strong_signal = sig.signal_class in {"A", "BASE_A", "REVERSAL_A", "REVERSAL_DIV", "OB_A"}
 
     if sig.signal_class == "REJECT":
         if ENABLE_BLOCK_SIGNAL_CLASS_REJECT:
             return False, "signal_class_reject"
 
     if not structure_ok:
-        if ENABLE_BLOCK_STRUCTURE_FILTER:
+        if ENABLE_BLOCK_STRUCTURE_FILTER and not strong_signal:
             return False, "structure_filter"
 
     if not volume_confirmed:
@@ -42,7 +43,7 @@ def apply_block_filters(
             return False, "panic_regime"
 
     if reclaim_needed:
-        if ENABLE_BLOCK_ALT_RECLAIM_CONTEXT:
+        if ENABLE_BLOCK_ALT_RECLAIM_CONTEXT and not strong_signal:
             return False, "alt_needs_reclaim_context"
 
     if not oi_ready:

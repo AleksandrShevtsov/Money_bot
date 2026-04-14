@@ -67,6 +67,18 @@ def get_nearest_resistance(price, resistance_levels):
     return min(above) if above else None
 
 
+def get_second_support(price, support_levels):
+    below = [lvl for lvl in support_levels if lvl < price]
+    below = sorted(below, reverse=True)
+    return below[1] if len(below) > 1 else None
+
+
+def get_second_resistance(price, resistance_levels):
+    above = [lvl for lvl in resistance_levels if lvl > price]
+    above = sorted(above)
+    return above[1] if len(above) > 1 else None
+
+
 def calculate_sl_tp_from_levels(
     side,
     entry_price,
@@ -81,6 +93,8 @@ def calculate_sl_tp_from_levels(
 
     support = get_nearest_support(entry_price, supports)
     resistance = get_nearest_resistance(entry_price, resistances)
+    second_support = get_second_support(entry_price, supports)
+    second_resistance = get_second_resistance(entry_price, resistances)
 
     if side == "BUY":
         if support is not None and resistance is not None:
@@ -91,12 +105,33 @@ def calculate_sl_tp_from_levels(
             if risk > 0 and reward > 0:
                 rr = reward / risk
                 if rr >= min_rr:
-                    return {"stop": stop, "take": take, "support": support, "resistance": resistance, "rr": rr, "source": "levels"}
+                    tp2 = second_resistance * (1 - level_buffer_pct) if second_resistance is not None else take
+                    return {
+                        "stop": stop,
+                        "take": take,
+                        "tp1": take,
+                        "tp2": tp2,
+                        "support": support,
+                        "resistance": resistance,
+                        "liquidity_target": tp2 if tp2 > take else None,
+                        "rr": rr,
+                        "source": "levels",
+                    }
 
         stop = entry_price * (1 - fallback_sl_pct)
         take = entry_price * (1 + fallback_tp_pct)
         rr = (take - entry_price) / max(1e-9, entry_price - stop)
-        return {"stop": stop, "take": take, "support": support, "resistance": resistance, "rr": rr, "source": "fallback"}
+        return {
+            "stop": stop,
+            "take": take,
+            "tp1": take,
+            "tp2": take,
+            "support": support,
+            "resistance": resistance,
+            "liquidity_target": None,
+            "rr": rr,
+            "source": "fallback",
+        }
 
     if support is not None and resistance is not None:
         stop = resistance * (1 + level_buffer_pct)
@@ -106,9 +141,30 @@ def calculate_sl_tp_from_levels(
         if risk > 0 and reward > 0:
             rr = reward / risk
             if rr >= min_rr:
-                return {"stop": stop, "take": take, "support": support, "resistance": resistance, "rr": rr, "source": "levels"}
+                tp2 = second_support * (1 + level_buffer_pct) if second_support is not None else take
+                return {
+                    "stop": stop,
+                    "take": take,
+                    "tp1": take,
+                    "tp2": tp2,
+                    "support": support,
+                    "resistance": resistance,
+                    "liquidity_target": tp2 if tp2 < take else None,
+                    "rr": rr,
+                    "source": "levels",
+                }
 
     stop = entry_price * (1 + fallback_sl_pct)
     take = entry_price * (1 - fallback_tp_pct)
     rr = (entry_price - take) / max(1e-9, stop - entry_price)
-    return {"stop": stop, "take": take, "support": support, "resistance": resistance, "rr": rr, "source": "fallback"}
+    return {
+        "stop": stop,
+        "take": take,
+        "tp1": take,
+        "tp2": take,
+        "support": support,
+        "resistance": resistance,
+        "liquidity_target": None,
+        "rr": rr,
+        "source": "fallback",
+    }

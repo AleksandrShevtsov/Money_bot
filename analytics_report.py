@@ -55,6 +55,42 @@ def build_signal_type_report(path="trades.csv"):
     return report
 
 
+def build_signal_class_report(path="trades.csv"):
+    rows = load_trades_csv(path)
+    stats = defaultdict(lambda: {
+        "count": 0,
+        "wins": 0,
+        "losses": 0,
+        "net": 0.0,
+    })
+
+    for row in rows:
+        signal_class = row.get("signal_class", "") or "UNKNOWN"
+        pnl = float(row.get("pnl", 0) or 0)
+        s = stats[signal_class]
+        s["count"] += 1
+        s["net"] += pnl
+        if pnl >= 0:
+            s["wins"] += 1
+        else:
+            s["losses"] += 1
+
+    report = []
+    for signal_class, s in stats.items():
+        winrate = (s["wins"] / s["count"] * 100) if s["count"] else 0.0
+        report.append({
+            "signal_class": signal_class,
+            "count": s["count"],
+            "wins": s["wins"],
+            "losses": s["losses"],
+            "winrate_pct": round(winrate, 2),
+            "net": round(s["net"], 2),
+        })
+
+    report.sort(key=lambda x: x["net"], reverse=True)
+    return report
+
+
 if __name__ == "__main__":
     report = build_signal_type_report("trades.csv")
     for row in report:
