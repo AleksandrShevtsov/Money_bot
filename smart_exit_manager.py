@@ -97,6 +97,7 @@ class SmartExitManager:
             new_stop = price * (1 + atr_gap_pct)
             pos["stop"] = min(old_stop, new_stop, pos["entry"])
 
+        pos["trail_active"] = True
         return old_stop, pos["stop"]
 
     def hold_seconds_for_position(self, pos):

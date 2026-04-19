@@ -24,12 +24,36 @@ class BingXRealExecutor:
     def has_credentials(self):
         return bool(self.api_key and self.secret_key)
 
+    def _normalize_symbol(self, symbol: str) -> str:
+        clean = str(symbol or "").strip().upper()
+        if "-" in clean:
+            return clean
+        if clean.endswith("USDT"):
+            return f"{clean[:-4]}-USDT"
+        return clean
+
+    def _normalize_quantity(self, quantity: float) -> str:
+        value = max(0.0, float(quantity or 0.0))
+        text = f"{value:.6f}".rstrip("0").rstrip(".")
+        return text or "0"
+
+    def _ensure_success(self, payload, action: str):
+        if not isinstance(payload, dict):
+            raise RuntimeError(f"{action} failed: invalid_response")
+
+        code = payload.get("code")
+        if code not in (0, "0", None):
+            message = payload.get("msg") or payload.get("message") or "api_rejected"
+            raise RuntimeError(f"{action} failed: code={code} msg={message}")
+
+        return payload
+
     def _sign_params(self, params: dict) -> dict:
         params = dict(params)
         params["timestamp"] = int(time.time() * 1000)
         params["recvWindow"] = 5000
 
-        query = urlencode(sorted(params.items()))
+        query = urlencode(params)
         signature = hmac.new(
             self.secret_key.encode("utf-8"),
             query.encode("utf-8"),
@@ -53,18 +77,74 @@ class BingXRealExecutor:
         response.raise_for_status()
         return response.json()
 
+    def _extract_balance_from_payload(self, payload):
+        if not isinstance(payload, dict):
+            return None
+
+        candidates = []
+        for root_key in ("data", "result"):
+            root = payload.get(root_key)
+            if isinstance(root, dict):
+                candidates.append(root)
+                nested_balance = root.get("balance")
+                if isinstance(nested_balance, dict):
+                    candidates.append(nested_balance)
+                elif isinstance(nested_balance, list):
+                    candidates.extend(item for item in nested_balance if isinstance(item, dict))
+            elif isinstance(root, list):
+                candidates.extend(item for item in root if isinstance(item, dict))
+
+        preferred_assets = {"USDT", "USDⓢ", "USDT-FUTURES", "USDT_PERP"}
+        asset_keys = ("asset", "currency", "coin")
+        balance_keys = (
+            "availableMargin",
+            "availableBalance",
+            "availableAmt",
+            "balance",
+            "equity",
+            "walletBalance",
+        )
+
+        preferred_rows = []
+        generic_rows = []
+
+        for row in candidates:
+            asset_name = ""
+            for key in asset_keys:
+                value = row.get(key)
+                if value is not None:
+                    asset_name = str(value).upper()
+                    break
+            if asset_name in preferred_assets:
+                preferred_rows.append(row)
+            else:
+                generic_rows.append(row)
+
+        for row in preferred_rows + generic_rows:
+            for key in balance_keys:
+                value = row.get(key)
+                if value in (None, ""):
+                    continue
+                try:
+                    return float(value)
+                except Exception:
+                    continue
+
+        return None
+
     def set_leverage(self, symbol: str, side: str, leverage: int):
         if not self.enabled:
             return {"mode": "paper", "action": "set_leverage", "symbol": symbol, "side": side, "leverage": leverage}
 
-        return self._post(
+        payload = self._post(
             "/openApi/swap/v2/trade/leverage",
             {
-                "symbol": symbol,
+                "symbol": self._normalize_symbol(symbol),
                 "side": side,
                 "leverage": leverage,
             },
         )
+        return self._ensure_success(payload, "set_leverage")
 
     def place_market_order(self, symbol: str, side: str, quantity: float, position_side: str = None):
         if not self.enabled:
@@ -78,16 +158,17 @@ class BingXRealExecutor:
             }
 
         params = {
-            "symbol": symbol,
+            "symbol": self._normalize_symbol(symbol),
             "side": side,
             "type": "MARKET",
-            "quantity": quantity,
+            "quantity": self._normalize_quantity(quantity),
         }
 
         if position_side:
             params["positionSide"] = position_side
 
-        return self._post("/openApi/swap/v2/trade/order", params)
+        payload = self._post("/openApi/swap/v2/trade/order", params)
+        return self._ensure_success(payload, "place_market_order")
 
     def reduce_position(self, symbol: str, side: str, quantity: float, position_side: str = None):
         if not self.enabled:
@@ -101,17 +182,18 @@ class BingXRealExecutor:
             }
 
         params = {
-            "symbol": symbol,
+            "symbol": self._normalize_symbol(symbol),
             "side": side,
             "type": "MARKET",
-            "quantity": quantity,
+            "quantity": self._normalize_quantity(quantity),
             "reduceOnly": True,
         }
 
         if position_side:
             params["positionSide"] = position_side
 
-        return self._post("/openApi/swap/v2/trade/order", params)
+        payload = self._post("/openApi/swap/v2/trade/order", params)
+        return self._ensure_success(payload, "reduce_position")
 
     def close_all_positions(self, symbol: str = None):
         if not self.enabled:
@@ -154,16 +236,42 @@ class BingXRealExecutor:
 
         return positions
 
+    def fetch_account_balance(self):
+        if not self.enabled:
+            return {"mode": "paper", "balance": None}
+
+        last_error = None
+        for path in (
+            "/openApi/swap/v2/user/balance",
+            "/openApi/swap/v2/user/account",
+            "/openApi/swap/v2/user/positions",
+        ):
+            try:
+                payload = self._get(path, {})
+                balance = self._extract_balance_from_payload(payload)
+                if balance is not None:
+                    return {
+                        "ok": True,
+                        "balance": balance,
+                        "path": path,
+                        "payload": payload,
+                    }
+            except Exception as e:
+                last_error = str(e)
+
+        return {"ok": False, "balance": None, "reason": last_error or "balance_unavailable"}
+
     def test_connection(self):
         if not self.has_credentials():
             return {"enabled": self.enabled, "ok": False, "reason": "missing_bingx_credentials"}
 
         try:
             payload = self._get("/openApi/swap/v2/user/positions", {})
+            code = payload.get("code") if isinstance(payload, dict) else None
             return {
                 "enabled": self.enabled,
-                "ok": True,
-                "reason": "ok",
+                "ok": code == 0,
+                "reason": "ok" if code == 0 else payload.get("msg", "api_rejected"),
                 "raw_keys": list(payload.keys()) if isinstance(payload, dict) else [],
             }
         except Exception as e:

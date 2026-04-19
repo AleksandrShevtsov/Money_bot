@@ -29,7 +29,6 @@ from config import (
     EXTENSION_LOOKBACK,
     MAX_EXTENSION_FROM_LOCAL_LOW_PCT,
     MAX_EXTENSION_FROM_LOCAL_HIGH_PCT,
-    TOP_SYMBOLS_COUNT,
     TOP_VOLUME_SYMBOLS_COUNT,
     TOP_GAINERS_COUNT,
     TOP_LOSERS_COUNT,
@@ -44,6 +43,8 @@ from config import (
     TAKE_PROFIT_PCT,
     INVERT_SIGNALS,
     HEARTBEAT_SECONDS,
+    OPEN_POSITIONS_REPORT_SECONDS,
+    MAX_POSITION_DEPOSIT_DRAWDOWN_PCT,
     COOLDOWN_SECONDS,
     STOPLOSS_COOLDOWN_SECONDS,
     LOW_PRICE_REQUIRES_RETEST,
@@ -69,6 +70,9 @@ from config import (
     CHART_PATTERN_LOOKBACK_4H,
     MAX_CHART_PATTERN_EXTENSION_PCT,
     BTC_REGIME_CONFLICT_PENALTY,
+    FUNDING_RATE_ENABLED,
+    FUNDING_RATE_STRONG_THRESHOLD,
+    FUNDING_RATE_EXTREME_THRESHOLD,
 )
 from utils import log, log_green, log_red, log_yellow, log_cyan
 from exchange_momentum_scanner import ExchangeMomentumScanner
@@ -111,6 +115,7 @@ from chart_pattern_detector import (
     confirm_chart_pattern_entry_15m,
     chart_pattern_not_overextended,
 )
+from funding_context import classify_funding_context
 
 
 class SmartMomentumPaperBot:
@@ -124,6 +129,7 @@ class SmartMomentumPaperBot:
         self.cooldown_until = {}
         self.last_signal = {}
         self.last_heartbeat = 0.0
+        self.last_open_positions_report = 0.0
         self.market_feed = None
         self.oi_client = BybitOIClient(rest_base=BYBIT_REST_BASE)
         self.state_store = BotStateStore()
@@ -159,8 +165,6 @@ class SmartMomentumPaperBot:
         self.sync_with_exchange_state()
         self.check_integrations()
 
-        self.notifier.send("🤖 Бот запущен")
-
     def invert_side_if_needed(self, side: str) -> str:
         if not INVERT_SIGNALS:
             return side
@@ -192,9 +196,11 @@ class SmartMomentumPaperBot:
     def _exchange_close_side(self, side: str) -> str:
         return "SELL" if side == "BUY" else "BUY"
 
-    def _symbol_profile(self, symbol: str) -> str:
+    def _symbol_profile(self, symbol: str, current_price: float | None = None) -> str:
         if symbol in {"BTCUSDT", "ETHUSDT"}:
             return "CORE"
+        if current_price is not None and current_price < LOW_PRICE_COIN_THRESHOLD:
+            return "LOW_CAP"
         return "ALT"
 
     def _safe_detect(self, label, fn, *args, default=None, **kwargs):
@@ -203,6 +209,148 @@ class SmartMomentumPaperBot:
         except Exception as e:
             log_yellow(f"DETECT FAIL {label} | error={e}")
             return default
+
+    def _fmt_money(self, value):
+        try:
+            return f"{float(value):,.2f} USDT"
+        except Exception:
+            return "n/a"
+
+    def _fmt_price(self, value):
+        try:
+            price = float(value)
+        except Exception:
+            return "n/a"
+
+        if price >= 1000:
+            return f"{price:,.2f}"
+        if price >= 1:
+            return f"{price:,.4f}"
+        return f"{price:,.6f}"
+
+    def _fetch_real_balance(self):
+        if EXECUTION_MODE != "real" or not BINGX_ENABLED:
+            return {"ok": False, "balance": None, "reason": "real_mode_disabled"}
+        if not self.executor.has_credentials():
+            return {"ok": False, "balance": None, "reason": "missing_bingx_credentials"}
+        return self.executor.fetch_account_balance()
+
+    def _startup_status_message(self, real_balance_info=None):
+        mode_label = "REAL" if EXECUTION_MODE == "real" and BINGX_ENABLED else "PAPER"
+        lines = [
+            "Bot started",
+            f"Mode: {mode_label}",
+            f"Runtime balance: {self._fmt_money(self.balance)}",
+            f"Max open positions: {MAX_OPEN_POSITIONS}",
+            f"Entry allocation: {FIXED_MARGIN_PCT * 100:.1f}%",
+        ]
+
+        if real_balance_info and real_balance_info.get("ok"):
+            lines.append(f"BingX balance: {self._fmt_money(real_balance_info.get('balance'))}")
+        elif EXECUTION_MODE == "real" and BINGX_ENABLED:
+            lines.append(
+                f"BingX balance: unavailable ({real_balance_info.get('reason', 'unknown') if real_balance_info else 'unknown'})"
+            )
+
+        return "\n".join(lines)
+
+    def _is_strong_signal_class(self, signal_class: str) -> bool:
+        return signal_class in {"A", "BASE_A", "REVERSAL_A", "REVERSAL_DIV", "OB_A", "PATTERN_A"}
+
+    def _normalize_signal_class(
+        self,
+        signal_class,
+        score,
+        strong_reversal_context=False,
+        retest_confirmation=None,
+        breakout_confirmation=None,
+        trendline_confirmation=None,
+        base_entry=None,
+        reversal_entry=None,
+        order_block_entry=None,
+        chart_pattern_entry=None,
+        regime_name="range_day",
+        symbol_profile="ALT",
+    ):
+        normalized = signal_class
+        reasons = []
+        confirmed_entry = any(
+            item is not None for item in [
+                retest_confirmation,
+                breakout_confirmation,
+                trendline_confirmation,
+                base_entry,
+                reversal_entry,
+                order_block_entry,
+                chart_pattern_entry,
+            ]
+        )
+
+        if normalized == "REJECT" and score >= 0.72 and (strong_reversal_context or confirmed_entry):
+            normalized = "B"
+            reasons.append("score_class_sync_reject_up")
+        elif normalized == "C" and score >= 0.68 and (strong_reversal_context or confirmed_entry):
+            normalized = "B"
+            reasons.append("score_class_sync_up")
+        elif normalized == "B" and score < 0.32 and not strong_reversal_context and retest_confirmation is None:
+            normalized = "C"
+            reasons.append("score_class_sync_down")
+
+        if symbol_profile == "LOW_CAP" and regime_name == "high_volatility_panic" and normalized == "B" and not strong_reversal_context:
+            normalized = "C"
+            reasons.append("low_cap_panic_downgrade")
+
+        return normalized, reasons
+
+    def _hydrate_runtime_position(self, symbol, pos):
+        if not isinstance(pos, dict):
+            return None
+
+        entry = float(pos.get("entry", 0.0) or 0.0)
+        qty = float(pos.get("qty", 0.0) or 0.0)
+        side = pos.get("side", "BUY")
+        take = float(pos.get("take", entry) or entry)
+        stop = float(pos.get("stop", entry) or entry)
+        level_data = pos.get("level_data") or {}
+
+        pos["entry"] = entry
+        pos["qty"] = qty
+        pos["side"] = side
+        pos["take"] = take
+        pos["stop"] = stop
+        pos["tp1"] = float(pos.get("tp1", level_data.get("tp1", take)) or take)
+        pos["tp2"] = float(pos.get("tp2", level_data.get("tp2", take)) or take)
+        pos["liquidity_target"] = pos.get("liquidity_target", level_data.get("liquidity_target"))
+        pos["margin"] = float(pos.get("margin", 0.0) or 0.0)
+        pos["notional"] = float(pos.get("notional", qty * entry) or (qty * entry))
+        pos["risk_usdt"] = float(pos.get("risk_usdt", abs(entry - stop) * qty) or 0.0)
+        pos["leverage"] = int(pos.get("leverage", 1) or 1)
+        pos["atr_pct"] = float(pos.get("atr_pct", 0.0) or 0.0)
+        pos["opened_at"] = float(pos.get("opened_at", time.time()) or time.time())
+        pos["signal_score"] = float(pos.get("signal_score", 0.0) or 0.0)
+        pos["signal_class"] = str(pos.get("signal_class", "REJECT") or "REJECT")
+        pos["symbol_profile"] = pos.get("symbol_profile") or self._symbol_profile(symbol, current_price=entry)
+        pos["account_balance_at_open"] = float(pos.get("account_balance_at_open", self.balance) or self.balance)
+        pos["btc_regime"] = pos.get("btc_regime", "unknown")
+        pos["btc_bias"] = pos.get("btc_bias", "NEUTRAL")
+        pos["funding_label"] = pos.get("funding_label", "unknown")
+        pos["funding_rate"] = float(pos.get("funding_rate", 0.0) or 0.0)
+        pos["htf_context"] = pos.get("htf_context", "")
+        pos["entry_context"] = pos.get("entry_context", "")
+        pos["be_moved"] = bool(pos.get("be_moved", False))
+        pos["partial_done"] = bool(pos.get("partial_done", False))
+        pos["trail_active"] = bool(pos.get("trail_active", False))
+
+        if pos["signal_class"] == "C" and pos["signal_score"] >= 0.78:
+            pos["signal_class"] = "B"
+            pos["reason"] = f"{pos.get('reason', '')}|runtime_class_sync_up"
+
+        if pos["symbol_profile"] == "LOW_CAP" and pos["signal_class"] in {"B", "C", "REJECT"}:
+            pos["leverage"] = min(pos["leverage"], 8 if pos["signal_class"] == "B" else 5)
+        elif pos["signal_class"] in {"C", "REJECT"}:
+            pos["leverage"] = min(pos["leverage"], 14 if pos["symbol_profile"] == "ALT" else 20)
+
+        return pos
 
     def _trade_log_meta(self, pos, exit_type):
         return {
@@ -234,6 +382,26 @@ class SmartMomentumPaperBot:
                 log_yellow(f"BINGX connection issue | reason={bingx_result.get('reason')}")
                 if TELEGRAM_ENABLED:
                     self.notifier.send(f"⚠️ BINGX connection issue: {bingx_result.get('reason')}")
+
+        real_balance_info = None
+        if EXECUTION_MODE == "real" and BINGX_ENABLED:
+            real_balance_info = self._fetch_real_balance()
+            if real_balance_info.get("ok") and real_balance_info.get("balance") is not None:
+                self.balance = float(real_balance_info["balance"])
+                self.risk_guard.initialize_balance(self.balance)
+                log_green(
+                    f"BINGX balance synced | balance={self._fmt_money(self.balance)} | "
+                    f"path={real_balance_info.get('path', 'unknown')}"
+                )
+            else:
+                log_yellow(
+                    f"BINGX balance unavailable | reason={real_balance_info.get('reason', 'unknown')}"
+                )
+
+        startup_text = self._startup_status_message(real_balance_info=real_balance_info)
+        log_cyan(startup_text.replace("\n", " | "))
+        if TELEGRAM_ENABLED:
+            self.notifier.send(startup_text)
 
     def _empty_position_slot(self, symbol: str):
         if symbol not in self.positions:
@@ -268,7 +436,12 @@ class SmartMomentumPaperBot:
             return
 
         self.balance = float(state.get("balance", self.balance))
-        self.positions = state.get("positions", {}) or {}
+        raw_positions = state.get("positions", {}) or {}
+        self.positions = {}
+        for symbol, pos in raw_positions.items():
+            hydrated = self._hydrate_runtime_position(symbol, pos)
+            if hydrated is not None:
+                self.positions[symbol] = hydrated
         self.cooldown_until = state.get("cooldown_until", {}) or {}
         self.last_signal = state.get("last_signal", {}) or {}
         self.risk_guard.hydrate(state.get("risk_guard", {}) or {})
@@ -305,11 +478,15 @@ class SmartMomentumPaperBot:
                 "qty": qty,
                 "stop": entry,
                 "take": entry,
+                "tp1": entry,
+                "tp2": entry,
                 "leverage": 1,
                 "margin": 0.0,
                 "notional": qty * entry,
                 "risk_usdt": 0.0,
                 "level_data": None,
+                "liquidity_target": None,
+                "atr_pct": 0.0,
                 "be_moved": False,
                 "partial_done": False,
                 "trail_active": False,
@@ -317,6 +494,14 @@ class SmartMomentumPaperBot:
                 "reason": "restored_from_exchange",
                 "signal_score": 0.0,
                 "signal_class": "SYNCED",
+                "symbol_profile": self._symbol_profile(symbol, current_price=entry),
+                "account_balance_at_open": self.balance,
+                "btc_regime": "unknown",
+                "btc_bias": "NEUTRAL",
+                "funding_label": "unknown",
+                "funding_rate": 0.0,
+                "htf_context": "",
+                "entry_context": "",
                 "external_sync_only": True,
             }
             log_yellow(f"SYNC RESTORE {symbol} | side={side} | qty={qty:.4f} | entry={entry:.4f}")
@@ -398,12 +583,14 @@ class SmartMomentumPaperBot:
             candles=candles,
             signal_class=signal_class,
             levels_candles=levels_candles,
+            symbol_profile=(strategy_meta or {}).get("symbol_profile", "ALT"),
         )
 
         pos["opened_at"] = time.time()
         pos["reason"] = reason
         pos["signal_score"] = score
         pos["signal_class"] = signal_class
+        pos["account_balance_at_open"] = self.balance
         if strategy_meta:
             pos.update(strategy_meta)
 
@@ -604,6 +791,12 @@ class SmartMomentumPaperBot:
         if pos.get("external_sync_only"):
             return
 
+        account_balance_at_open = float(pos.get("account_balance_at_open", self.balance) or self.balance)
+        max_position_drawdown = account_balance_at_open * MAX_POSITION_DEPOSIT_DRAWDOWN_PCT
+        if self.exit_manager.unrealized_pnl(pos, current_price) <= -max_position_drawdown:
+            self.close_position(symbol, current_price, "max_deposit_drawdown_exit")
+            return
+
         if self.exit_manager.should_be_and_partial_on_profit(pos, current_price):
             if not pos.get("be_moved"):
                 old_stop, new_stop = self.exit_manager.apply_break_even(pos)
@@ -697,15 +890,53 @@ class SmartMomentumPaperBot:
                 pnl = (pos["entry"] - now_price) * pos["qty"]
 
             log_cyan(
-                f"OPEN_POS {symbol} {pos['side']} | class={pos.get('signal_class', 'REJECT')} | entry={pos['entry']:.4f} | "
-                f"now={now_price:.4f} | entry_usdt={pos.get('notional', 0.0):.2f} | "
-                f"margin={pos.get('margin', 0.0):.2f} | risk_usdt={pos.get('risk_usdt', 0.0):.2f} | "
-                f"SL={pos['stop']:.4f} | TP={pos['take']:.4f} | qty={pos['qty']:.4f} | "
-                f"lev=x{pos['leverage']} | unrealized_pnl={pnl:.2f}"
+                f"OPEN_POS {symbol} | {pos['side']} | class={pos.get('signal_class', 'REJECT')} | "
+                f"entry={self._fmt_price(pos['entry'])} -> now={self._fmt_price(now_price)} | "
+                f"PnL={self._fmt_money(pnl)} | risk={self._fmt_money(pos.get('risk_usdt', 0.0))} | "
+                f"margin={self._fmt_money(pos.get('margin', 0.0))} | lev=x{pos['leverage']} | "
+                f"SL={self._fmt_price(pos['stop'])} | TP1={self._fmt_price(pos.get('tp1', pos['take']))} | "
+                f"TP2={self._fmt_price(pos.get('tp2', pos['take']))}"
             )
 
         if not any_open:
             log_cyan("OPEN_POS none")
+
+    def build_open_positions_report(self):
+        rows = []
+        total_unrealized = 0.0
+
+        for symbol, pos in self.positions.items():
+            if pos is None:
+                continue
+
+            candles = fetch_klines(symbol, "15m", 5)
+            now_price = candles[-1]["close"] if candles else 0.0
+
+            if pos["side"] == "BUY":
+                pnl = (now_price - pos["entry"]) * pos["qty"]
+            else:
+                pnl = (pos["entry"] - now_price) * pos["qty"]
+
+            total_unrealized += pnl
+            rows.append(
+                f"{symbol} | {pos['side']} | class={pos.get('signal_class', 'REJECT')} | "
+                f"entry={self._fmt_price(pos['entry'])} | now={self._fmt_price(now_price)} | "
+                f"pnl={self._fmt_money(pnl)} | risk={self._fmt_money(pos.get('risk_usdt', 0.0))} | "
+                f"SL={self._fmt_price(pos['stop'])} | TP1={self._fmt_price(pos.get('tp1', pos['take']))} | "
+                f"TP2={self._fmt_price(pos.get('tp2', pos['take']))} | lev=x{pos['leverage']} | "
+                f"btc={pos.get('btc_regime', '')} | funding={pos.get('funding_label', '')}"
+            )
+
+        if not rows:
+            return "OPEN_POS none"
+
+        return (
+            f"Open positions\n"
+            f"Count: {len(rows)}\n"
+            f"Unrealized PnL: {self._fmt_money(total_unrealized)}\n"
+            f"Runtime balance: {self._fmt_money(self.balance)}\n\n"
+            + "\n".join(rows)
+        )
     
 
     def analyze_symbol(self, symbol):
@@ -738,6 +969,17 @@ class SmartMomentumPaperBot:
                 "strength": 0.0,
                 "reason": "btc_regime_unavailable",
             }
+        funding_context = classify_funding_context(
+            symbol,
+            strong_threshold=FUNDING_RATE_STRONG_THRESHOLD,
+            extreme_threshold=FUNDING_RATE_EXTREME_THRESHOLD,
+        ) if FUNDING_RATE_ENABLED else {
+            "rate": None,
+            "label": "funding_disabled",
+            "continuation_bias": "NEUTRAL",
+            "reversal_bias": "NEUTRAL",
+            "score_bias": 0.0,
+        }
 
         breakout_4h = detect_range_breakout(candles_4h)
         trendline_4h = detect_trendline_breakout(candles_4h)
@@ -764,16 +1006,16 @@ class SmartMomentumPaperBot:
         pattern = None
         trades = []
         imbalance = 0.0
-        oi_now = None
-        oi_prev = None
-        oi_data = None
+        if self.market_feed is not None:
+            trades, feed_price, imbalance = self.market_feed.snapshot(symbol)
+            if feed_price is not None:
+                current_price = float(feed_price)
 
-        if symbol in {"BTCUSDT", "ETHUSDT", "SOLUSDT"}:
-            symbol_profile = "CORE"
-        elif current_price < 0.10:
-            symbol_profile = "LOW_CAP"
-        else:
-            symbol_profile = "ALT"
+        oi_now, oi_prev = self.oi_client.get_oi_pair(symbol)
+        oi_data = classify_oi_price_context(candles_4h, oi_now, oi_prev, lookback=4)
+        oi_ready = oi_data.get("label") != "oi_unavailable"
+
+        symbol_profile = self._symbol_profile(symbol, current_price=current_price)
 
         liquidity_sweep_4h = self._safe_detect("liquidity_sweep_4h", detect_liquidity_sweep, candles_4h, default=None)
         liquidity_sweep = self._safe_detect("liquidity_sweep_15m", detect_liquidity_sweep, candles, default=None)
@@ -910,6 +1152,7 @@ class SmartMomentumPaperBot:
             imbalance=imbalance,
             oi_now=oi_now,
             oi_prev=oi_prev,
+            oi_context=oi_data,
             pattern=pattern,
             breakout_confirmation=breakout_4h,
             trendline_confirmation=trendline_4h,
@@ -1068,6 +1311,19 @@ class SmartMomentumPaperBot:
                 }
             )
         )
+        continuation_context = bool(
+            (breakout_4h and breakout_4h.get("direction") == sig.side)
+            or (trendline_4h and trendline_4h.get("direction") == sig.side)
+            or (base_breakout and base_breakout.get("direction") == sig.side)
+            or (chart_pattern and chart_pattern.get("direction") == sig.side and chart_pattern.get("pattern") in {
+                "ascending_triangle",
+                "descending_triangle",
+                "symmetrical_triangle",
+                "rectangle",
+                "cup_and_handle",
+                "inverse_cup_and_handle",
+            })
+        )
 
         # мягкий HTF penalty
         if htf_trend == "BULL" and sig.side == "SELL":
@@ -1085,6 +1341,22 @@ class SmartMomentumPaperBot:
             penalty = BTC_REGIME_CONFLICT_PENALTY * (0.6 if strong_reversal_context else 1.0)
             sig.score = max(0.0, sig.score - penalty)
             sig.reason = f"{sig.reason}|btc_regime_conflict"
+
+        if (
+            funding_context["continuation_bias"] == sig.side
+            and continuation_context
+            and not strong_reversal_context
+            and sig.side in {"BUY", "SELL"}
+        ):
+            sig.score = max(0.0, sig.score + funding_context["score_bias"])
+            sig.reason = f"{sig.reason}|{funding_context['label']}"
+        elif (
+            funding_context["reversal_bias"] == sig.side
+            and strong_reversal_context
+            and sig.side in {"BUY", "SELL"}
+        ):
+            sig.score = max(sig.score, min(0.8, sig.score + abs(funding_context["score_bias"]) * 0.5))
+            sig.reason = f"{sig.reason}|funding_reversal_alignment"
 
         volume_confirmed = volume_confirmed_15m or volume_confirmed_4h
         structure_ok = structure_allows_side(structure_4h, sig.side) if sig.side in ("BUY", "SELL") else False
@@ -1114,6 +1386,22 @@ class SmartMomentumPaperBot:
             chart_pattern_signal=chart_pattern,
             chart_pattern_confirmed=bool(chart_pattern_entry),
         )
+
+        signal_class, sync_reasons = self._normalize_signal_class(
+            signal_class=signal_class,
+            score=sig.score,
+            strong_reversal_context=strong_reversal_context,
+            retest_confirmation=retest_confirmation,
+            breakout_confirmation=breakout_confirmation,
+            trendline_confirmation=trendline_confirmation,
+            base_entry=base_entry,
+            reversal_entry=reversal_entry,
+            order_block_entry=order_block_entry,
+            chart_pattern_entry=chart_pattern_entry,
+            regime_name=regime_name,
+            symbol_profile=symbol_profile,
+        )
+        quality_reasons.extend(sync_reasons)
 
         sig.signal_class = signal_class
         sig.reason = f"{sig.reason}|class={signal_class}|q={','.join(quality_reasons)}"
@@ -1193,6 +1481,7 @@ class SmartMomentumPaperBot:
                     candles=candles,
                     signal_class=sig.signal_class,
                     levels_candles=candles_1h,
+                    symbol_profile=symbol_profile,
                 )
                 level_data = preview_pos.get("level_data")
                 if level_data:
@@ -1214,6 +1503,10 @@ class SmartMomentumPaperBot:
             sig.signal_class = "B"
             sig.reason = f"{sig.reason}|reject_overridden_by_rr={rr_value:.2f}"
 
+        strong_signal_class = self._is_strong_signal_class(sig.signal_class)
+        weak_signal_class = sig.signal_class in {"C", "REJECT"}
+        high_rr_trade = rr_value >= HIGH_RR_OVERRIDE_THRESHOLD
+
         if order_block and order_block.get("direction") != sig.side and not strong_reversal_context:
             if order_block.get("pattern") == "bullish_order_block" and sig.side == "SELL":
                 log_yellow(f"BLOCKED {symbol} | reason=against_bullish_order_block")
@@ -1229,11 +1522,51 @@ class SmartMomentumPaperBot:
             log_yellow(f"BLOCKED {symbol} | reason=btc_bearish_conflict")
             return
 
+        if (
+            symbol_profile == "LOW_CAP"
+            and regime_name == "high_volatility_panic"
+            and continuation_context
+            and not strong_reversal_context
+            and not strong_signal_class
+        ):
+            log_yellow(f"BLOCKED {symbol} | reason=low_cap_panic_continuation")
+            return
+
+        if (
+            funding_context["continuation_bias"] == sig.side
+            and continuation_context
+            and not strong_reversal_context
+            and abs(float(funding_context.get("rate") or 0.0)) >= FUNDING_RATE_STRONG_THRESHOLD
+            and rr_value < HIGH_RR_OVERRIDE_THRESHOLD
+        ):
+            log_yellow(f"BLOCKED {symbol} | reason=funding_conflict")
+            return
+
         # для low-cap не пускаем C/REJECT без retest
         if symbol_profile == "LOW_CAP" and retest_confirmation is None and sig.signal_class not in {
             "A", "B", "BASE_A", "REVERSAL_A", "REVERSAL_DIV", "OB_A", "PATTERN_A"
         }:
             log_yellow(f"BLOCKED {symbol} | reason=low_cap_needs_better_context")
+            return
+
+        if (
+            symbol_profile == "LOW_CAP"
+            and continuation_context
+            and not strong_reversal_context
+            and retest_confirmation is None
+            and liquidity_sweep is None
+            and not high_rr_trade
+        ):
+            log_yellow(f"BLOCKED {symbol} | reason=low_cap_continuation_needs_retest")
+            return
+
+        if (
+            symbol_profile == "LOW_CAP"
+            and weak_signal_class
+            and (not level_data or level_data.get("source") != "levels")
+            and not high_rr_trade
+        ):
+            log_yellow(f"BLOCKED {symbol} | reason=low_cap_needs_structural_levels")
             return
 
         # breakout без объема разрешаем только если есть retest или RR очень высокий
@@ -1255,7 +1588,7 @@ class SmartMomentumPaperBot:
                 and retest_confirmation is None
                 and sig.signal_class not in {"A", "BASE_A", "REVERSAL_A", "REVERSAL_DIV", "OB_A", "PATTERN_A"}
             ),
-            oi_ready=(oi_data is not None),
+            oi_ready=oi_ready,
             htf_conflict=(btc_regime["bias"] not in {"NEUTRAL", sig.side} and btc_regime["strength"] >= 0.8),
             extension_block=blocked_ext,
             anti_fomo_block=blocked,
@@ -1286,6 +1619,8 @@ class SmartMomentumPaperBot:
                 "symbol_profile": symbol_profile,
                 "btc_regime": btc_regime["regime"],
                 "btc_bias": btc_regime["bias"],
+                "funding_label": funding_context["label"],
+                "funding_rate": funding_context["rate"],
                 "htf_context": "|".join(
                     item for item in [
                         breakout_4h["reason"] if breakout_4h else "",
@@ -1337,7 +1672,11 @@ class SmartMomentumPaperBot:
             f"mode={EXECUTION_MODE} | feed_ready={self.feed_health.feed_ready(self.market_feed)} | "
             f"trading_enabled={can_trade}{'' if can_trade else f' | reason={risk_reason}'}"
         )
-        self.print_open_positions()
+        if time.time() - self.last_open_positions_report >= OPEN_POSITIONS_REPORT_SECONDS:
+            report_text = self.build_open_positions_report()
+            self.print_open_positions()
+            self.notifier.send(report_text)
+            self.last_open_positions_report = time.time()
         self.save_runtime_state()
 
     def run(self):
