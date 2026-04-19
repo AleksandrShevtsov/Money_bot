@@ -235,7 +235,39 @@ class SmartMomentumPaperBot:
             return {"ok": False, "balance": None, "reason": "missing_bingx_credentials"}
         return self.executor.fetch_account_balance()
 
-    def _startup_status_message(self, real_balance_info=None):
+    def _real_trading_readiness(self):
+        if EXECUTION_MODE != "real" or not BINGX_ENABLED:
+            return {"enabled": False, "ready": False, "reason": "real_mode_disabled"}
+
+        balance_info = self._fetch_real_balance()
+        if not balance_info.get("ok"):
+            return {"enabled": True, "ready": False, "reason": balance_info.get("reason", "balance_unavailable")}
+
+        available_balance = float(balance_info.get("balance") or 0.0)
+        if available_balance <= 0:
+            return {"enabled": True, "ready": False, "reason": "available_balance_zero", "balance": available_balance}
+
+        try:
+            btc_price = float(fetch_klines("BTCUSDT", "15m", 1)[-1]["close"])
+        except Exception:
+            btc_price = 0.0
+
+        btc_probe = self.executor.precheck_market_order(
+            symbol="BTCUSDT",
+            quantity=0.0001,
+            price=btc_price,
+            available_balance=available_balance,
+        )
+        return {
+            "enabled": True,
+            "ready": bool(btc_probe.get("ok")),
+            "balance": available_balance,
+            "btc_price": btc_price,
+            "probe": btc_probe,
+            "reason": "ok" if btc_probe.get("ok") else btc_probe.get("reason", "probe_failed"),
+        }
+
+    def _startup_status_message(self, real_balance_info=None, readiness_info=None):
         mode_label = "REAL" if EXECUTION_MODE == "real" and BINGX_ENABLED else "PAPER"
         lines = [
             "Bot started",
@@ -251,6 +283,16 @@ class SmartMomentumPaperBot:
             lines.append(
                 f"BingX balance: unavailable ({real_balance_info.get('reason', 'unknown') if real_balance_info else 'unknown'})"
             )
+
+        if readiness_info and readiness_info.get("enabled"):
+            probe = readiness_info.get("probe") or {}
+            status = "READY" if readiness_info.get("ready") else f"BLOCKED ({readiness_info.get('reason', 'unknown')})"
+            lines.append(f"Real trading readiness: {status}")
+            if probe.get("market_symbol"):
+                lines.append(
+                    f"BTC probe: market={probe.get('market_symbol')} | "
+                    f"min_qty={probe.get('min_qty', 'n/a')} | min_notional={probe.get('min_notional', 'n/a')}"
+                )
 
         return "\n".join(lines)
 
@@ -398,7 +440,22 @@ class SmartMomentumPaperBot:
                     f"BINGX balance unavailable | reason={real_balance_info.get('reason', 'unknown')}"
                 )
 
-        startup_text = self._startup_status_message(real_balance_info=real_balance_info)
+        readiness_info = self._real_trading_readiness()
+        if readiness_info.get("enabled"):
+            probe = readiness_info.get("probe") or {}
+            log_cyan(
+                f"REAL READINESS | ready={readiness_info.get('ready')} | "
+                f"balance={self._fmt_money(readiness_info.get('balance', 0.0))} | "
+                f"reason={readiness_info.get('reason')} | "
+                f"btc_market={probe.get('market_symbol', 'n/a')} | "
+                f"min_qty={probe.get('min_qty', 'n/a')} | "
+                f"min_notional={probe.get('min_notional', 'n/a')}"
+            )
+
+        startup_text = self._startup_status_message(
+            real_balance_info=real_balance_info,
+            readiness_info=readiness_info,
+        )
         log_cyan(startup_text.replace("\n", " | "))
         if TELEGRAM_ENABLED:
             self.notifier.send(startup_text)
@@ -530,11 +587,14 @@ class SmartMomentumPaperBot:
             return False
 
     def update_symbols(self):
-        self.symbols = self.scanner.get_priority_symbols(
+        symbols = self.scanner.get_priority_symbols(
             top_volume_n=TOP_VOLUME_SYMBOLS_COUNT,
             top_gainers_n=TOP_GAINERS_COUNT,
             top_losers_n=TOP_LOSERS_COUNT,
         )
+        if EXECUTION_MODE == "real" and BINGX_ENABLED:
+            symbols = [symbol for symbol in symbols if self.executor.supports_contract(symbol)]
+        self.symbols = symbols
         self.configure_market_feed()
 
         log_cyan("UPDATED SYMBOL LIST:")
@@ -594,6 +654,55 @@ class SmartMomentumPaperBot:
         if strategy_meta:
             pos.update(strategy_meta)
 
+        if EXECUTION_MODE == "real" and BINGX_ENABLED:
+            order_precheck = self.executor.precheck_market_order(
+                symbol=symbol,
+                quantity=pos["qty"],
+                price=entry_price,
+                available_balance=self.balance,
+            )
+            if not order_precheck.get("ok"):
+                suggested_quantity = float(order_precheck.get("suggested_quantity") or 0.0)
+                if suggested_quantity > pos["qty"] and entry_price > 0:
+                    required_margin = (suggested_quantity * entry_price) / max(1, int(pos["leverage"]))
+                    max_margin_cap = self.balance * FIXED_MARGIN_PCT
+                    if required_margin <= max_margin_cap * 1.05:
+                        scale = suggested_quantity / max(pos["qty"], 1e-12)
+                        pos["qty"] = suggested_quantity
+                        pos["margin"] = required_margin
+                        pos["notional"] = suggested_quantity * entry_price
+                        pos["risk_usdt"] *= scale
+                        order_precheck = self.executor.precheck_market_order(
+                            symbol=symbol,
+                            quantity=pos["qty"],
+                            price=entry_price,
+                            available_balance=self.balance,
+                        )
+
+                if not order_precheck.get("ok"):
+                    reason_text = order_precheck.get("reason", "real_order_precheck_failed")
+                    extra = []
+                    if order_precheck.get("min_qty") is not None:
+                        extra.append(f"min_qty={order_precheck.get('min_qty')}")
+                    if order_precheck.get("min_notional") is not None:
+                        extra.append(f"min_notional={order_precheck.get('min_notional')}")
+                    if order_precheck.get("notional") is not None:
+                        extra.append(f"notional={order_precheck.get('notional'):.4f}")
+                    if order_precheck.get("suggested_quantity") is not None:
+                        extra.append(f"suggested_qty={order_precheck.get('suggested_quantity')}")
+                    details = f" | {' | '.join(extra)}" if extra else ""
+                    log_yellow(f"BLOCKED {symbol} | reason={reason_text}{details}")
+                    self.notifier.send(f"⚠️ REAL ORDER BLOCKED {symbol}\nReason: {reason_text}{details}")
+                    return
+
+            normalized_qty = float(order_precheck.get("quantity", pos["qty"]) or pos["qty"])
+            if normalized_qty != pos["qty"] and pos["qty"] > 0:
+                scale = normalized_qty / pos["qty"]
+                pos["qty"] = normalized_qty
+                pos["margin"] *= scale
+                pos["notional"] = normalized_qty * pos["entry"]
+                pos["risk_usdt"] *= scale
+
         self.positions[symbol] = pos
 
         log_green(
@@ -626,16 +735,40 @@ class SmartMomentumPaperBot:
         if EXECUTION_MODE == "real" and BINGX_ENABLED:
             try:
                 leverage_side = self._exchange_position_side(side)
-                self.executor.set_leverage(symbol, leverage_side, int(pos["leverage"]))
-                self.executor.place_market_order(
+                try:
+                    lev_result = self.executor.set_leverage(symbol, leverage_side, int(pos["leverage"]))
+                except Exception as lev_error:
+                    lev_result = {"code": "warn", "msg": str(lev_error)}
+                    log_yellow(f"REAL LEVERAGE WARN {symbol} {side}: {lev_error}")
+                    self.notifier.send(f"⚠️ REAL LEVERAGE WARN {symbol}: {lev_error}")
+                order_result = self.executor.place_market_order(
                     symbol=symbol,
                     side=side,
                     quantity=round(pos["qty"], 6),
                     position_side=leverage_side,
                 )
-                self.notifier.send(f"✅ REAL ORDER SENT {symbol} {side}")
+                protect_result = self.executor.place_protective_orders(
+                    symbol=symbol,
+                    close_side=self._exchange_close_side(side),
+                    quantity=round(pos["qty"], 6),
+                    stop_loss_price=pos["stop"],
+                    take_profit_price=pos.get("tp2", pos["take"]),
+                    position_side=leverage_side,
+                )
+                log_green(
+                    f"REAL ORDER OK {symbol} {side} | lev={pos['leverage']} | qty={pos['qty']:.6f} | "
+                    f"lev_code={lev_result.get('code', 0)} | order_code={order_result.get('code', 0)}"
+                )
+                self.notifier.send(
+                    f"✅ REAL ORDER SENT {symbol} {side}\n"
+                    f"Qty: {pos['qty']:.6f}\n"
+                    f"Lev: x{pos['leverage']}\n"
+                    f"Exchange SL: {pos['stop']:.6f}\n"
+                    f"Exchange TP: {pos.get('tp2', pos['take']):.6f}"
+                )
             except Exception as e:
                 self.positions[symbol] = None
+                log_red(f"REAL ORDER ERROR {symbol} {side}: {e}")
                 self.notifier.send(f"❌ REAL ORDER ERROR {symbol}: {e}")
                 return
 

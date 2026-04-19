@@ -1,3 +1,0 @@
-time,symbol,side,entry,exit,qty,pnl,result,reason,balance_after,signal_class,signal_score,rr_value,exit_type,btc_regime,symbol_profile,htf_context,entry_context
-2026-04-19 13:17:52,RAVEUSDT,SELL,1.20447,1.17092,8.548158,0.286791,PLUS,partial_close,104.338988,C,0.563,2.0,partial_close,squeeze,ALT,trendline_break_down|bearish_order_block|fast_down_move,fast_down_move
-2026-04-19 13:24:22,RAVEUSDT,SELL,1.20447,1.21145,8.548158,-0.059666,MINUS,stop_loss,104.279322,C,0.563,2.0,stop_loss,squeeze,ALT,trendline_break_down|bearish_order_block|fast_down_move,fast_down_move

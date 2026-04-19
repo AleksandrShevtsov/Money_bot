@@ -61,19 +61,10 @@ class PositionManager:
 
     def _risk_cap_pct(self, symbol_profile, signal_class):
         if symbol_profile == "CORE":
-            base = CORE_MAX_RISK_PCT
-        elif symbol_profile == "LOW_CAP":
-            base = LOW_CAP_MAX_RISK_PCT
-        else:
-            base = ALT_MAX_RISK_PCT
-
-        if signal_class in {"A", "BASE_A", "REVERSAL_A", "REVERSAL_DIV", "OB_A", "PATTERN_A"}:
-            return base
-        if signal_class == "B":
-            return base * 0.8
-        if signal_class == "C":
-            return base * 0.55
-        return base * 0.35
+            return CORE_MAX_RISK_PCT
+        if symbol_profile == "LOW_CAP":
+            return LOW_CAP_MAX_RISK_PCT
+        return ALT_MAX_RISK_PCT
 
     def build_position(
         self,
@@ -91,7 +82,7 @@ class PositionManager:
         lev = self.get_leverage(score, symbol_profile=symbol_profile, signal_class=signal_class)
 
         size_mult = signal_size_multiplier(score, signal_class=signal_class)
-        margin = min(balance * self.entry_pct * size_mult, balance * self.entry_pct)
+        margin = balance * self.entry_pct
         notional = margin * lev
         qty = notional / price if price else 0.0
 
