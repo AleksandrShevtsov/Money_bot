@@ -1,8 +1,8 @@
 from binance_candles_feed import fetch_klines
 
 
-def detect_htf_trend(symbol):
-    candles = fetch_klines(symbol, "4h", 200)
+def detect_htf_trend(symbol, timeframe="4h"):
+    candles = fetch_klines(symbol, timeframe, 200)
     if candles is None or len(candles) < 50:
         return "FLAT"
 

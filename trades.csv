@@ -1,0 +1,22 @@
+time,symbol,side,entry,exit,qty,pnl,result,reason,balance_after,signal_class,signal_score,rr_value,exit_type,btc_regime,symbol_profile,htf_context,entry_context
+2026-04-19 16:03:14,BNBUSDT,BUY,625.87,624.46,0.11,-0.1551,MINUS,reverse_signal,99.5699,C,0.413,2.0,reverse_signal,range,ALT,trendline_break_up|price_acceleration_up,price_acceleration_up
+2026-04-19 16:23:14,PROMUSDT,BUY,2.249,2.306,31.039,1.769223,PLUS,reverse_signal,101.339123,C,0.44,2.0,reverse_signal,range,ALT,fast_up_move,fast_up_move|price_acceleration_up
+2026-04-19 16:39:43,RAVEUSDT,SELL,1.13766,1.1448,62.35,-0.445179,MINUS,reverse_signal,100.893944,C,0.4,2.0,reverse_signal,range,ALT,trendline_break_down|retest_after_breakout_sell|bearish_order_block|fast_down_move|price_acceleration_down,fast_down_move
+2026-04-19 16:46:27,PROMUSDT,BUY,2.336,2.31,30.233,-0.786058,MINUS,reverse_signal,48.590742,C,0.41,2.0,reverse_signal,range,ALT,trendline_break_up|fast_up_move,fast_up_move
+2026-04-19 16:57:12,PROMUSDT,BUY,2.289,2.302,14.859,0.193167,PLUS,reverse_signal,48.783909,C,0.628,2.0,reverse_signal,range,ALT,trendline_break_up|fast_up_move,fast_up_move
+2026-04-19 17:01:33,BNBUSDT,BUY,626.415,626.61,0.05,0.00975,PLUS,reverse_signal,48.793659,C,0.395,2.0,reverse_signal,range,ALT,trendline_break_up|retest_after_breakout_buy|fast_up_move|price_acceleration_up,price_acceleration_up
+2026-04-19 17:05:25,RAVEUSDT,SELL,1.13464,1.05896,15.23,1.152606,PLUS,partial_close,49.946265,C,0.482,2.0,partial_close,range,ALT,trendline_break_down|retest_after_breakout_sell|bearish_order_block|fast_down_move|price_acceleration_down,price_acceleration_down
+2026-04-19 17:07:41,HIGHUSDT,SELL,0.3105,0.3073,224.8,0.71936,PLUS,reverse_signal,50.665625,C,0.56,2.0,reverse_signal,range,ALT,bearish_order_block,fast_down_move
+2026-04-19 17:19:22,PROMUSDT,BUY,2.348,2.364,15.104,0.241664,PLUS,reverse_signal,50.907289,C,0.515,2.144297,reverse_signal,range,ALT,trendline_break_up|fast_up_move|price_acceleration_up,fast_up_move
+2026-04-19 17:21:15,RAVEUSDT,SELL,1.0334,0.97578,17.155,0.988471,PLUS,partial_close,51.895761,C,0.4,2.0,partial_close,range,ALT,trendline_break_down|bearish_order_block|fast_down_move|price_acceleration_down,fast_down_move
+2026-04-19 17:24:26,ALICEUSDT,SELL,0.1588,0.1562,107.5,0.2795,PLUS,partial_close,94.0289,C,0.39,4.416216,partial_close,range,ALT,trendline_break_up|bearish_order_block|fast_down_move,trendline_break_down|fast_down_move|price_acceleration_down
+2026-04-19 17:24:27,ALICEUSDT,SELL,0.1588,0.1562,107.5,0.2795,PLUS,reverse_signal,94.3084,C,0.39,4.416216,reverse_signal,range,ALT,trendline_break_up|bearish_order_block|fast_down_move,trendline_break_down|fast_down_move|price_acceleration_down
+2026-04-19 17:25:53,RAVEUSDT,SELL,1.0334,0.92722,17.155,1.821518,PLUS,liquidity_target,96.129918,C,0.4,2.0,liquidity_target,range,ALT,trendline_break_down|bearish_order_block|fast_down_move|price_acceleration_down,fast_down_move
+2026-04-19 17:28:09,HIGHUSDT,BUY,0.3218,0.3148,58.2,-0.4074,MINUS,reverse_signal,95.722518,C,0.64,2.971446,reverse_signal,range,ALT,macd_divergence_mtf|bearish_order_block,fast_up_move
+2026-04-19 17:37:03,ZECUSDT,SELL,326.17,322.4,0.0675,0.254475,PLUS,partial_close,95.976993,B,0.42,6.90571,partial_close,range,ALT,fast_down_move,trendline_break_down
+2026-04-19 17:37:28,BLURUSDT,SELL,0.034925,0.03275,580.0,1.2615,PLUS,partial_close,97.238493,REVERSAL_A,0.91,2.0,partial_close,range,LOW_CAP,trendline_break_up|exhaustion_reversal_sell|bullish_order_block|fast_up_move,reversal_15m_retest_confirm_sell|fast_up_move
+2026-04-19 17:39:06,DOGEUSDT,SELL,0.09497,0.09465,251.0,0.08032,PLUS,reverse_signal,97.318813,REJECT,0.48,1.94866,reverse_signal,range,LOW_CAP,,trendline_break_down|retest_after_breakout_sell
+2026-04-19 17:43:09,HIGHUSDT,BUY,0.308,0.3083,93.2,0.02796,PLUS,reverse_signal,97.346773,C,0.64,4.944267,reverse_signal,range,ALT,macd_divergence_mtf|bearish_order_block|fast_down_move,fast_down_move
+2026-04-19 17:55:53,XRPUSDT,SELL,1.4246,1.4294,47.0,-0.2256,MINUS,reverse_signal,97.121173,C,0.657,2.0,reverse_signal,range,ALT,,trendline_break_down|price_acceleration_down
+2026-04-19 18:08:58,GUAUSDT,BUY,0.7375,0.7498,92.1,1.13283,PLUS,reverse_signal,98.254003,C,0.411,1.321221,reverse_signal,squeeze,ALT,bullish_order_block|fast_up_move,fast_up_move
+2026-04-19 18:28:30,RAVEUSDT,SELL,0.99044,0.929,34.72,2.133197,PLUS,partial_close,100.3872,C,0.447,2.0,partial_close,squeeze,ALT,trendline_break_down|bearish_order_block|fast_down_move,fast_down_move|price_acceleration_up

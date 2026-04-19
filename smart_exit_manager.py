@@ -1,17 +1,20 @@
 class SmartExitManager:
     def __init__(self):
-        self.break_even_trigger = 0.40
-        self.partial_tp_trigger = 0.60
+        self.partial_tp_trigger = 0.50
         self.partial_close_fraction = 0.50
         self.trail_trigger = 0.85
         self.trail_gap_pct = 0.006
         self.atr_trail_mult = 1.6
+        self.stop_lock_steps = (
+            (0.30, 0.10),
+            (0.50, 0.20),
+        )
 
         self.min_hold_seconds = 180
         self.strong_hold_seconds = 900
         self.strong_signal_score = 0.85
 
-        self.profit_be_partial_trigger = 0.30
+        self.profit_be_partial_trigger = 0.50
 
         # Главная правка: не душим сделки слишком рано.
         # 15m стратегия не должна закрываться через 2–3 минуты.
@@ -45,15 +48,19 @@ class SmartExitManager:
             return 0.0
         return self.unrealized_pnl(pos, price) / margin
 
+    def reward_progress(self, pos, price):
+        entry = float(pos.get("entry", 0.0) or 0.0)
+        take = float(pos.get("take", entry) or entry)
+        qty = float(pos.get("qty", 0.0) or 0.0)
+        target_reward = abs(take - entry) * qty
+        if target_reward <= 0:
+            return 0.0
+        return max(0.0, self.unrealized_pnl(pos, price) / target_reward)
+
     def should_be_and_partial_on_profit(self, pos, price):
         if pos.get("partial_done"):
             return False
-        return self.pnl_pct_on_margin(pos, price) >= self.profit_be_partial_trigger
-
-    def should_move_to_break_even(self, pos, price):
-        if pos.get("be_moved"):
-            return False
-        return self.progress_to_take(pos, price) >= self.break_even_trigger
+        return self.reward_progress(pos, price) >= self.profit_be_partial_trigger
 
     def apply_break_even(self, pos):
         old_stop = pos["stop"]
@@ -66,6 +73,33 @@ class SmartExitManager:
         pos["be_moved"] = True
         return old_stop, pos["stop"]
 
+    def get_stop_lock_target(self, pos, price):
+        progress = self.reward_progress(pos, price)
+        current_stage = float(pos.get("stop_lock_stage", 0.0) or 0.0)
+
+        best_stage = None
+        for trigger_progress, lock_progress in self.stop_lock_steps:
+            if progress >= trigger_progress and lock_progress > current_stage:
+                best_stage = lock_progress
+
+        return best_stage
+
+    def apply_profit_lock(self, pos, lock_progress):
+        old_stop = pos["stop"]
+        entry = float(pos.get("entry", 0.0) or 0.0)
+        take = float(pos.get("take", entry) or entry)
+
+        if pos["side"] == "BUY":
+            locked_stop = entry + (take - entry) * lock_progress
+            pos["stop"] = max(old_stop, locked_stop)
+        else:
+            locked_stop = entry - (entry - take) * lock_progress
+            pos["stop"] = min(old_stop, locked_stop)
+
+        pos["stop_lock_stage"] = lock_progress
+        pos["be_moved"] = pos["stop"] != old_stop or bool(pos.get("be_moved"))
+        return old_stop, pos["stop"]
+
     def should_partial_close(self, pos, price):
         if pos.get("partial_done"):
             return False
@@ -75,7 +109,7 @@ class SmartExitManager:
                 return True
             if pos["side"] == "SELL" and price <= tp1:
                 return True
-        return self.progress_to_take(pos, price) >= self.partial_tp_trigger
+        return self.reward_progress(pos, price) >= self.partial_tp_trigger
 
     def get_partial_fraction(self):
         return self.partial_close_fraction

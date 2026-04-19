@@ -243,7 +243,7 @@ class SmartMomentumPaperBot:
         if not balance_info.get("ok"):
             return {"enabled": True, "ready": False, "reason": balance_info.get("reason", "balance_unavailable")}
 
-        available_balance = float(balance_info.get("balance") or 0.0)
+        available_balance = float(balance_info.get("available_balance", balance_info.get("balance")) or 0.0)
         if available_balance <= 0:
             return {"enabled": True, "ready": False, "reason": "available_balance_zero", "balance": available_balance}
 
@@ -261,7 +261,8 @@ class SmartMomentumPaperBot:
         return {
             "enabled": True,
             "ready": bool(btc_probe.get("ok")),
-            "balance": available_balance,
+            "balance": float(balance_info.get("balance") or 0.0),
+            "available_balance": available_balance,
             "btc_price": btc_price,
             "probe": btc_probe,
             "reason": "ok" if btc_probe.get("ok") else btc_probe.get("reason", "probe_failed"),
@@ -278,7 +279,9 @@ class SmartMomentumPaperBot:
         ]
 
         if real_balance_info and real_balance_info.get("ok"):
-            lines.append(f"BingX balance: {self._fmt_money(real_balance_info.get('balance'))}")
+            lines.append(f"BingX equity: {self._fmt_money(real_balance_info.get('balance'))}")
+            if real_balance_info.get("available_balance") is not None:
+                lines.append(f"Available margin: {self._fmt_money(real_balance_info.get('available_balance'))}")
         elif EXECUTION_MODE == "real" and BINGX_ENABLED:
             lines.append(
                 f"BingX balance: unavailable ({real_balance_info.get('reason', 'unknown') if real_balance_info else 'unknown'})"
@@ -380,6 +383,7 @@ class SmartMomentumPaperBot:
         pos["htf_context"] = pos.get("htf_context", "")
         pos["entry_context"] = pos.get("entry_context", "")
         pos["be_moved"] = bool(pos.get("be_moved", False))
+        pos["stop_lock_stage"] = float(pos.get("stop_lock_stage", 0.0) or 0.0)
         pos["partial_done"] = bool(pos.get("partial_done", False))
         pos["trail_active"] = bool(pos.get("trail_active", False))
 
@@ -545,6 +549,7 @@ class SmartMomentumPaperBot:
                 "liquidity_target": None,
                 "atr_pct": 0.0,
                 "be_moved": False,
+                "stop_lock_stage": 0.0,
                 "partial_done": False,
                 "trail_active": False,
                 "opened_at": time.time(),
@@ -582,8 +587,69 @@ class SmartMomentumPaperBot:
             )
             return True
         except Exception as e:
+            error_text = str(e)
+            if "code=101205" in error_text or "No position to close" in error_text:
+                log_yellow(f"REAL CLOSE SYNC {symbol} | exchange reports position already closed")
+                try:
+                    self.executor.cancel_protective_orders(
+                        symbol=symbol,
+                        position_side=self._exchange_position_side(pos["side"]),
+                    )
+                except Exception:
+                    pass
+                self.notifier.send(
+                    f"ℹ️ REAL CLOSE SYNC {symbol}\n"
+                    f"Exchange status: position already closed\n"
+                    f"Local state will be cleared"
+                )
+                return True
             log_red(f"REAL CLOSE ERROR {symbol}: {e}")
             self.notifier.send(f"❌ REAL CLOSE ERROR {symbol}: {e}")
+            return False
+
+    def _sync_protection_on_exchange(self, symbol, pos, reason="update"):
+        if EXECUTION_MODE != "real" or not BINGX_ENABLED:
+            return True
+
+        protect_qty = round(float(pos.get("qty", 0.0) or 0.0), 6)
+        if protect_qty <= 0:
+            return False
+
+        position_side = self._exchange_position_side(pos["side"])
+        close_side = self._exchange_close_side(pos["side"])
+
+        try:
+            cancel_result = self.executor.cancel_protective_orders(symbol=symbol, position_side=position_side)
+            protect_result = self.executor.place_protective_orders(
+                symbol=symbol,
+                close_side=close_side,
+                quantity=protect_qty,
+                stop_loss_price=pos["stop"],
+                take_profit_price=pos.get("tp2", pos["take"]),
+                position_side=position_side,
+            )
+            cancelled = len((((cancel_result or {}).get("data") or {}).get("cancelled") or []))
+            created_data = (protect_result or {}).get("data") or {}
+            created = sum(1 for key in ("stop_loss", "take_profit") if created_data.get(key))
+            log_cyan(
+                f"REAL PROTECTION SYNC {symbol} | reason={reason} | qty={protect_qty:.6f} | "
+                f"SL={pos['stop']:.6f} | TP={pos.get('tp2', pos['take']):.6f} | "
+                f"cancelled={cancelled} | created={created}"
+            )
+            self.notifier.send(
+                f"🛡️ PROTECTION UPDATED {symbol}\n"
+                f"Reason: {reason}\n"
+                f"Side: {pos['side']}\n"
+                f"Qty: {protect_qty:.6f}\n"
+                f"SL: {pos['stop']:.6f}\n"
+                f"TP: {pos.get('tp2', pos['take']):.6f}\n"
+                f"Cancelled old orders: {cancelled}\n"
+                f"Created protective orders: {created}"
+            )
+            return True
+        except Exception as e:
+            log_red(f"REAL PROTECTION ERROR {symbol}: {e}")
+            self.notifier.send(f"❌ REAL PROTECTION ERROR {symbol}: {e}")
             return False
 
     def update_symbols(self):
@@ -655,17 +721,23 @@ class SmartMomentumPaperBot:
             pos.update(strategy_meta)
 
         if EXECUTION_MODE == "real" and BINGX_ENABLED:
+            live_balance_info = self._fetch_real_balance()
+            available_balance = (
+                float(live_balance_info.get("available_balance", live_balance_info.get("balance")) or 0.0)
+                if live_balance_info.get("ok")
+                else self.balance
+            )
             order_precheck = self.executor.precheck_market_order(
                 symbol=symbol,
                 quantity=pos["qty"],
                 price=entry_price,
-                available_balance=self.balance,
+                available_balance=available_balance,
             )
             if not order_precheck.get("ok"):
                 suggested_quantity = float(order_precheck.get("suggested_quantity") or 0.0)
                 if suggested_quantity > pos["qty"] and entry_price > 0:
                     required_margin = (suggested_quantity * entry_price) / max(1, int(pos["leverage"]))
-                    max_margin_cap = self.balance * FIXED_MARGIN_PCT
+                    max_margin_cap = min(self.balance * FIXED_MARGIN_PCT, available_balance)
                     if required_margin <= max_margin_cap * 1.05:
                         scale = suggested_quantity / max(pos["qty"], 1e-12)
                         pos["qty"] = suggested_quantity
@@ -676,7 +748,7 @@ class SmartMomentumPaperBot:
                             symbol=symbol,
                             quantity=pos["qty"],
                             price=entry_price,
-                            available_balance=self.balance,
+                            available_balance=available_balance,
                         )
 
                 if not order_precheck.get("ok"):
@@ -694,6 +766,15 @@ class SmartMomentumPaperBot:
                     log_yellow(f"BLOCKED {symbol} | reason={reason_text}{details}")
                     self.notifier.send(f"⚠️ REAL ORDER BLOCKED {symbol}\nReason: {reason_text}{details}")
                     return
+
+            if pos.get("margin", 0.0) > available_balance:
+                details = (
+                    f"required_margin={pos.get('margin', 0.0):.4f} | "
+                    f"available_balance={available_balance:.4f}"
+                )
+                log_yellow(f"BLOCKED {symbol} | reason=insufficient_available_margin | {details}")
+                self.notifier.send(f"⚠️ REAL ORDER BLOCKED {symbol}\nReason: insufficient_available_margin | {details}")
+                return
 
             normalized_qty = float(order_precheck.get("quantity", pos["qty"]) or pos["qty"])
             if normalized_qty != pos["qty"] and pos["qty"] > 0:
@@ -896,6 +977,7 @@ class SmartMomentumPaperBot:
         pos["partial_done"] = True
         pos["margin"] *= (1 - fraction)
         pos["notional"] *= (1 - fraction)
+        self._sync_protection_on_exchange(symbol, pos, reason="partial_close")
 
         log_cyan(
             f"PARTIAL {symbol} {pos['side']} | exit={price:.4f} | "
@@ -930,12 +1012,23 @@ class SmartMomentumPaperBot:
             self.close_position(symbol, current_price, "max_deposit_drawdown_exit")
             return
 
+        lock_stage = self.exit_manager.get_stop_lock_target(pos, current_price)
+        if lock_stage is not None:
+            old_stop, new_stop = self.exit_manager.apply_profit_lock(pos, lock_stage)
+            if old_stop != new_stop:
+                self._sync_protection_on_exchange(symbol, pos, reason=f"profit_lock_{int(lock_stage * 100)}")
+                log_cyan(
+                    f"PROFIT LOCK {symbol} | stage={int(lock_stage * 100)}% | "
+                    f"old_SL={old_stop:.4f} | new_SL={new_stop:.4f}"
+                )
+                self.notifier.send(
+                    f"🟦 PROFIT LOCK {symbol}\n"
+                    f"Stage: {int(lock_stage * 100)}%\n"
+                    f"Old SL: {old_stop:.6f}\n"
+                    f"New SL: {new_stop:.6f}"
+                )
+
         if self.exit_manager.should_be_and_partial_on_profit(pos, current_price):
-            if not pos.get("be_moved"):
-                old_stop, new_stop = self.exit_manager.apply_break_even(pos)
-                if old_stop != new_stop:
-                    log_cyan(f"BE {symbol} | old_SL={old_stop:.4f} | new_SL={new_stop:.4f}")
-                    self.notifier.send(f"🟦 BE {symbol}\nOld SL: {old_stop:.6f}\nNew SL: {new_stop:.6f}")
 
             if not pos.get("partial_done"):
                 self.partial_close(symbol, current_price)
@@ -943,12 +1036,6 @@ class SmartMomentumPaperBot:
         pos = self.positions.get(symbol)
         if pos is None:
             return
-
-        if self.exit_manager.should_move_to_break_even(pos, current_price):
-            old_stop, new_stop = self.exit_manager.apply_break_even(pos)
-            if old_stop != new_stop:
-                log_cyan(f"BE {symbol} | old_SL={old_stop:.4f} | new_SL={new_stop:.4f}")
-                self.notifier.send(f"🟦 BE {symbol}\nOld SL: {old_stop:.6f}\nNew SL: {new_stop:.6f}")
 
         if self.exit_manager.should_partial_close(pos, current_price):
             self.partial_close(symbol, current_price)
@@ -960,6 +1047,7 @@ class SmartMomentumPaperBot:
         if self.exit_manager.should_activate_trailing(pos, current_price):
             old_stop, new_stop = self.exit_manager.apply_trailing(pos, current_price)
             if old_stop != new_stop:
+                self._sync_protection_on_exchange(symbol, pos, reason="trailing")
                 log_cyan(f"TRAIL {symbol} | old_SL={old_stop:.4f} | new_SL={new_stop:.4f}")
                 self.notifier.send(f"🟪 TRAIL {symbol}\nOld SL: {old_stop:.6f}\nNew SL: {new_stop:.6f}")
 
@@ -1073,13 +1161,13 @@ class SmartMomentumPaperBot:
     
 
     def analyze_symbol(self, symbol):
-        htf_trend = detect_htf_trend(symbol)
+        htf_trend = detect_htf_trend(symbol, timeframe="1h")
 
         candles = fetch_klines(symbol, "15m", 200)
         if not candles:
             return
         candles_1h = fetch_klines(symbol, "1h", 200) or []
-        candles_4h = fetch_klines(symbol, "4h", 120) or []
+        candles_4h = candles_1h
 
         current_price = float(candles[-1]["close"])
 

@@ -268,7 +268,10 @@ class BingXRealExecutor:
             payload = self._private_ccxt().set_leverage(
                 leverage,
                 ccxt_symbol,
-                {"marginMode": "cross"},
+                {
+                    "marginMode": "cross",
+                    "side": side,
+                },
             )
             return {"code": 0, "msg": "", "data": payload}
         except Exception as e:
@@ -298,13 +301,17 @@ class BingXRealExecutor:
         ccxt_symbol = self._contract_ccxt_symbol(symbol)
         ccxt_amount = float(params["quantity"])
         try:
+            ccxt_params = {}
+            if position_side:
+                ccxt_params["hedged"] = True
+                ccxt_params["positionSide"] = position_side
             payload = self._private_ccxt().create_order(
                 ccxt_symbol,
                 "market",
                 side.lower(),
                 ccxt_amount,
                 None,
-                {"positionSide": position_side} if position_side else {},
+                ccxt_params,
             )
             return {"code": 0, "msg": "", "data": payload}
         except Exception:
@@ -334,17 +341,21 @@ class BingXRealExecutor:
         ccxt_symbol = self._contract_ccxt_symbol(symbol)
         ccxt_amount = float(self._normalize_quantity(quantity))
         results = {}
+        hedged = bool(position_side)
 
         if stop_loss_price is not None:
             sl_params = {
-                "stopLossPrice": float(stop_loss_price),
-                "reduceOnly": True,
+                "stopPrice": float(stop_loss_price),
+                "workingType": "MARK_PRICE",
             }
-            if position_side:
+            if hedged:
+                sl_params["hedged"] = True
                 sl_params["positionSide"] = position_side
+            else:
+                sl_params["reduceOnly"] = True
             sl_order = self._private_ccxt().create_order(
                 ccxt_symbol,
-                "market",
+                "STOP_MARKET",
                 close_side.lower(),
                 ccxt_amount,
                 None,
@@ -354,14 +365,17 @@ class BingXRealExecutor:
 
         if take_profit_price is not None:
             tp_params = {
-                "takeProfitPrice": float(take_profit_price),
-                "reduceOnly": True,
+                "stopPrice": float(take_profit_price),
+                "workingType": "MARK_PRICE",
             }
-            if position_side:
+            if hedged:
+                tp_params["hedged"] = True
                 tp_params["positionSide"] = position_side
+            else:
+                tp_params["reduceOnly"] = True
             tp_order = self._private_ccxt().create_order(
                 ccxt_symbol,
-                "market",
+                "TAKE_PROFIT_MARKET",
                 close_side.lower(),
                 ccxt_amount,
                 None,
@@ -387,17 +401,21 @@ class BingXRealExecutor:
             "side": side,
             "type": "MARKET",
             "quantity": self._normalize_quantity(quantity),
-            "reduceOnly": True,
         }
 
         if position_side:
             params["positionSide"] = position_side
+        else:
+            params["reduceOnly"] = True
 
         ccxt_symbol = self._contract_ccxt_symbol(symbol)
         ccxt_amount = float(params["quantity"])
-        ccxt_params = {"reduceOnly": True}
+        ccxt_params = {}
         if position_side:
+            ccxt_params["hedged"] = True
             ccxt_params["positionSide"] = position_side
+        else:
+            ccxt_params["reduceOnly"] = True
         try:
             payload = self._private_ccxt().create_order(
                 ccxt_symbol,
@@ -411,6 +429,44 @@ class BingXRealExecutor:
         except Exception:
             payload = self._post("/openApi/swap/v2/trade/order", params)
             return self._ensure_success(payload, "reduce_position")
+
+    def cancel_protective_orders(self, symbol: str, position_side: str | None = None):
+        if not self.enabled:
+            return {"mode": "paper", "action": "cancel_protective_orders", "symbol": symbol, "position_side": position_side}
+
+        ccxt_symbol = self._contract_ccxt_symbol(symbol)
+        exchange = self._private_ccxt()
+        cancelled = []
+        protected_types = {
+            "STOP_MARKET",
+            "STOP",
+            "TAKE_PROFIT_MARKET",
+            "TAKE_PROFIT",
+        }
+
+        try:
+            open_orders = exchange.fetch_open_orders(ccxt_symbol)
+        except Exception as e:
+            raise RuntimeError(f"cancel_protective_orders fetch failed: {e}")
+
+        for order in open_orders:
+            raw = order.get("info") or {}
+            order_type = str(raw.get("type") or order.get("type") or "").upper()
+            order_position_side = str(raw.get("positionSide") or "").upper()
+            if order_type not in protected_types:
+                continue
+            if position_side and order_position_side and order_position_side != str(position_side).upper():
+                continue
+            order_id = raw.get("orderId") or order.get("id")
+            if not order_id:
+                continue
+            try:
+                exchange.cancel_order(str(order_id), ccxt_symbol)
+                cancelled.append(str(order_id))
+            except Exception:
+                continue
+
+        return {"code": 0, "msg": "", "data": {"cancelled": cancelled}}
 
     def close_all_positions(self, symbol: str = None):
         if not self.enabled:
@@ -481,13 +537,33 @@ class BingXRealExecutor:
         try:
             balance = self._private_ccxt().fetch_balance()
             usdt = balance.get("USDT") or {}
+            total_balance = usdt.get("total")
             free_balance = usdt.get("free")
-            if free_balance is not None:
+            if total_balance is not None or free_balance is not None:
+                payload = balance.get("info") or {}
+                equity = None
+                used_margin = None
+                if isinstance(payload, dict):
+                    rows = payload.get("data") or []
+                    if isinstance(rows, list):
+                        for row in rows:
+                            if str(row.get("asset") or "").upper() == "USDT":
+                                try:
+                                    equity = float(row.get("equity")) if row.get("equity") is not None else None
+                                except Exception:
+                                    equity = None
+                                try:
+                                    used_margin = float(row.get("usedMargin")) if row.get("usedMargin") is not None else None
+                                except Exception:
+                                    used_margin = None
+                                break
                 return {
                     "ok": True,
-                    "balance": float(free_balance),
+                    "balance": float(equity if equity is not None else (total_balance if total_balance is not None else free_balance)),
+                    "available_balance": float(free_balance if free_balance is not None else 0.0),
+                    "used_margin": used_margin,
                     "path": "ccxt.fetch_balance",
-                    "payload": balance.get("info"),
+                    "payload": payload,
                 }
         except Exception as e:
             last_error = str(e)
@@ -507,6 +583,7 @@ class BingXRealExecutor:
                     return {
                         "ok": True,
                         "balance": balance,
+                        "available_balance": balance,
                         "path": path,
                         "payload": payload,
                     }

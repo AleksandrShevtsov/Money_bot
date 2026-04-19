@@ -79,10 +79,9 @@ class PositionManager:
         levels_candles=None,
         symbol_profile="ALT",
     ):
-        lev = self.get_leverage(score, symbol_profile=symbol_profile, signal_class=signal_class)
-
         size_mult = signal_size_multiplier(score, signal_class=signal_class)
-        margin = balance * self.entry_pct
+        margin = balance * self.entry_pct * size_mult
+        lev = self.get_leverage(score, symbol_profile=symbol_profile, signal_class=signal_class)
         notional = margin * lev
         qty = notional / price if price else 0.0
 
@@ -151,11 +150,23 @@ class PositionManager:
 
         max_risk_usdt = balance * self._risk_cap_pct(symbol_profile, signal_class)
         if risk_usdt > max_risk_usdt and risk_usdt > 0:
-            risk_ratio = max_risk_usdt / risk_usdt
-            qty *= risk_ratio
-            margin *= risk_ratio
-            notional *= risk_ratio
-            risk_usdt = max_risk_usdt
+            lev_ratio = max_risk_usdt / risk_usdt
+            adjusted_lev = max(1, int(lev * lev_ratio))
+            if adjusted_lev < lev:
+                lev = adjusted_lev
+                notional = margin * lev
+                qty = notional / price if price else 0.0
+                if side == "BUY":
+                    risk_usdt = max(0.0, (price - stop) * qty)
+                else:
+                    risk_usdt = max(0.0, (stop - price) * qty)
+
+            if risk_usdt > max_risk_usdt and risk_usdt > 0:
+                risk_ratio = max_risk_usdt / risk_usdt
+                qty *= risk_ratio
+                margin *= risk_ratio
+                notional *= risk_ratio
+                risk_usdt = max_risk_usdt
 
         return {
             "side": side,
@@ -174,6 +185,7 @@ class PositionManager:
             "atr_pct": atr_pct(candles, period=14) if candles else 0.0,
             "signal_class": signal_class,
             "be_moved": False,
+            "stop_lock_stage": 0.0,
             "partial_done": False,
             "trail_active": False,
         }
