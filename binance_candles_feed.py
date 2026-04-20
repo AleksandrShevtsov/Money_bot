@@ -10,8 +10,11 @@ def fetch_klines(symbol, interval="15m", limit=200):
         "limit": limit
     }
 
-    r = requests.get(url, params=params, timeout=10)
-    r.raise_for_status()
+    try:
+        r = requests.get(url, params=params, timeout=10)
+        r.raise_for_status()
+    except requests.RequestException:
+        return []
 
     data = r.json()
     if not isinstance(data, list):

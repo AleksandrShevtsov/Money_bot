@@ -1,5 +1,5 @@
 {
-  "balance": 56.6642,
+  "balance": 58.0586,
   "positions": {
     "BTCUSDT": {
       "side": "SELL",
@@ -177,7 +177,7 @@
       "side": "SELL",
       "entry": 0.030365000000000003,
       "qty": 607.4,
-      "stop": 0.03327642,
+      "stop": 0.029747330505000003,
       "take": 0.02418830505,
       "tp1": 0.02461914,
       "tp2": 0.02418830505,
@@ -199,8 +199,8 @@
       "liquidity_target": 0.02418830505,
       "atr_pct": 0.04986660198884308,
       "signal_class": "REVERSAL_A",
-      "be_moved": false,
-      "stop_lock_stage": 0.0,
+      "be_moved": true,
+      "stop_lock_stage": 0.1,
       "partial_done": false,
       "trail_active": false,
       "opened_at": 1776659913.945127,
@@ -343,7 +343,10 @@
     "MUSDT": 0,
     "PIPPINUSDT": 0,
     "DYDXUSDT": 0,
-    "GWEIUSDT": 0
+    "GWEIUSDT": 0,
+    "MOVEUSDT": 0,
+    "MERLUSDT": 0,
+    "SUPERUSDT": 0
   },
   "last_signal": {
     "HYPEUSDT": "HOLD",
@@ -353,10 +356,10 @@
     "AAVEUSDT": "HOLD",
     "HIGHUSDT": "HOLD",
     "ETHUSDT": "HOLD",
-    "RAVEUSDT": "HOLD",
+    "RAVEUSDT": "SELL",
     "DOGEUSDT": "HOLD",
     "XRPUSDT": "HOLD",
-    "ZECUSDT": "SELL",
+    "ZECUSDT": "BUY",
     "BNBUSDT": "HOLD",
     "ENJUSDT": "SELL",
     "BLURUSDT": "SELL",
@@ -374,9 +377,9 @@
     "API3USDT": "BUY",
     "AIAUSDT": "HOLD",
     "KERNELUSDT": "HOLD",
-    "BIOUSDT": "HOLD",
+    "BIOUSDT": "SELL",
     "APRUSDT": "HOLD",
-    "SPKUSDT": "HOLD",
+    "SPKUSDT": "SELL",
     "BEATUSDT": "HOLD",
     "TRADOORUSDT": "SELL",
     "PORTALUSDT": "HOLD",
@@ -385,12 +388,17 @@
     "MUSDT": "HOLD",
     "PIPPINUSDT": "HOLD",
     "DYDXUSDT": "HOLD",
-    "GWEIUSDT": "HOLD"
+    "GWEIUSDT": "HOLD",
+    "MOVEUSDT": "HOLD",
+    "MERLUSDT": "BUY",
+    "SUPERUSDT": "BUY"
   },
   "symbol_loss_streaks": {
     "PHBUSDT": 1,
     "PORTALUSDT": 1
   },
+  "trade_open_timestamps": [],
+  "last_stop_meta": {},
   "risk_guard": {
     "day_key": "2026-04-20",
     "day_realized_pnl": -13.433887234999974,
@@ -398,5 +406,5 @@
     "start_balance": 100.0,
     "pause_reason": null
   },
-  "saved_at": 1776666122.1764414
+  "saved_at": 1776669067.5814803
 }

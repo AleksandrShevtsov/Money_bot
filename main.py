@@ -36,6 +36,8 @@ from config import (
     START_BALANCE_USDT,
     FIXED_MARGIN_PCT,
     MAX_OPEN_POSITIONS,
+    MAX_TRADES_PER_HOUR,
+    MAX_LOW_CAP_OPEN_POSITIONS,
     DAILY_LOSS_LIMIT_USDT,
     MAX_CONSECUTIVE_LOSSES,
     MAX_TOTAL_DRAWDOWN_PCT,
@@ -88,6 +90,9 @@ from config import (
     FUNDING_RATE_ENABLED,
     FUNDING_RATE_STRONG_THRESHOLD,
     FUNDING_RATE_EXTREME_THRESHOLD,
+    PREDICTIVE_FLOW_ENABLED,
+    PREDICTIVE_FLOW_CONFLICT_PENALTY,
+    PREDICTIVE_FLOW_MIN_STRENGTH,
     MAX_SYMBOL_CONSECUTIVE_LOSSES,
     SYMBOL_LOSS_COOLDOWN_SECONDS,
 )
@@ -103,6 +108,18 @@ from acceleration_detector import detect_price_acceleration
 from strategy import build_signal
 from position_manager import PositionManager
 from smart_exit_manager import SmartExitManager
+from signal_engine import quality_anchor_count, impulse_only_setup, conflict_reason
+from risk_manager import (
+    min_rr_for_context,
+    rr_validation_reason,
+    frequency_limit_reason,
+    low_cap_limit_reason,
+)
+from execution_controller import (
+    reentry_block_reason,
+    register_stop_reentry_requirement,
+    clear_reentry_requirement_if_changed,
+)
 from trade_history import ensure_history_files, append_trade
 from bot_state_store import BotStateStore
 from feed_health import FeedHealthMonitor
@@ -133,6 +150,7 @@ from chart_pattern_detector import (
     chart_pattern_not_overextended,
 )
 from funding_context import classify_funding_context
+from predictive_flow import analyze_predictive_flow
 
 
 class SmartMomentumPaperBot:
@@ -146,6 +164,8 @@ class SmartMomentumPaperBot:
         self.cooldown_until = {}
         self.last_signal = {}
         self.symbol_loss_streaks = {}
+        self.trade_open_timestamps = []
+        self.last_stop_meta = {}
         self.last_heartbeat = 0.0
         self.last_market_scan = 0.0
         self.last_positions_check = 0.0
@@ -757,6 +777,8 @@ class SmartMomentumPaperBot:
                 "cooldown_until": self.cooldown_until,
                 "last_signal": self.last_signal,
                 "symbol_loss_streaks": self.symbol_loss_streaks,
+                "trade_open_timestamps": self.trade_open_timestamps,
+                "last_stop_meta": self.last_stop_meta,
                 "risk_guard": self.risk_guard.snapshot(),
             }
         )
@@ -777,6 +799,8 @@ class SmartMomentumPaperBot:
         self.cooldown_until = state.get("cooldown_until", {}) or {}
         self.last_signal = state.get("last_signal", {}) or {}
         self.symbol_loss_streaks = state.get("symbol_loss_streaks", {}) or {}
+        self.trade_open_timestamps = state.get("trade_open_timestamps", []) or []
+        self.last_stop_meta = state.get("last_stop_meta", {}) or {}
         self.risk_guard.hydrate(state.get("risk_guard", {}) or {})
         self.risk_guard.initialize_balance(self.balance)
 
@@ -958,12 +982,28 @@ class SmartMomentumPaperBot:
         signal_class="REJECT",
         strategy_meta=None,
         levels_candles=None,
+        structure_15m=None,
     ):
         if self.positions.get(symbol) is not None:
             return
 
         if self.count_open_positions() >= MAX_OPEN_POSITIONS:
             log_yellow(f"SKIP {symbol} | reason=max_open_positions")
+            return
+
+        freq_reason, trimmed_timestamps = frequency_limit_reason(
+            self.trade_open_timestamps,
+            time.time(),
+            MAX_TRADES_PER_HOUR,
+        )
+        self.trade_open_timestamps = trimmed_timestamps
+        if freq_reason:
+            log_yellow(f"SKIP {symbol} | reason={freq_reason}")
+            return
+
+        low_cap_reason = low_cap_limit_reason(self.positions, MAX_LOW_CAP_OPEN_POSITIONS)
+        if low_cap_reason and (strategy_meta or {}).get("symbol_profile") == "LOW_CAP":
+            log_yellow(f"SKIP {symbol} | reason={low_cap_reason}")
             return
 
         allowed, risk_reason = self.risk_guard.can_open_new_position(self.balance)
@@ -989,6 +1029,7 @@ class SmartMomentumPaperBot:
         pos["signal_score"] = score
         pos["signal_class"] = signal_class
         pos["account_balance_at_open"] = self.balance
+        pos["entry_structure_15m"] = (structure_15m or {}).get("trend", "unknown")
         if strategy_meta:
             pos.update(strategy_meta)
 
@@ -1057,6 +1098,7 @@ class SmartMomentumPaperBot:
                 pos["risk_usdt"] *= scale
 
         self.positions[symbol] = pos
+        self.trade_open_timestamps.append(time.time())
 
         log_green(
             f"OPEN {symbol} {side} | class={signal_class} | entry={pos['entry']:.4f} | "
@@ -1199,6 +1241,12 @@ class SmartMomentumPaperBot:
             self.symbol_loss_streaks[symbol] = 0
 
         if reason == "stop_loss":
+            register_stop_reentry_requirement(
+                self.last_stop_meta,
+                symbol,
+                {"trend": pos.get("entry_structure_15m", "unknown")},
+                pos["side"],
+            )
             self.cooldown_until[symbol] = time.time() + STOPLOSS_COOLDOWN_SECONDS
             if (
                 pnl < 0
@@ -1461,6 +1509,8 @@ class SmartMomentumPaperBot:
 
     def analyze_symbol(self, symbol):
         htf_trend = detect_htf_trend(symbol, timeframe="1h")
+        anchor_count = 0
+        impulse_only = False
 
         candles = fetch_klines(symbol, "15m", 200)
         if not candles:
@@ -1540,6 +1590,21 @@ class SmartMomentumPaperBot:
             trades, feed_price, imbalance = self.market_feed.snapshot(symbol)
             if feed_price is not None:
                 current_price = float(feed_price)
+
+        predictive_flow_1h = analyze_predictive_flow(candles_1h, trades=None, imbalance=0.0) if PREDICTIVE_FLOW_ENABLED else {
+            "bias": "NEUTRAL",
+            "strength": 0.0,
+            "score_bias": 0.0,
+            "exhaustion": False,
+            "reason": "predictive_flow_disabled",
+        }
+        predictive_flow_15m = analyze_predictive_flow(candles, trades=trades, imbalance=imbalance) if PREDICTIVE_FLOW_ENABLED else {
+            "bias": "NEUTRAL",
+            "strength": 0.0,
+            "score_bias": 0.0,
+            "exhaustion": False,
+            "reason": "predictive_flow_disabled",
+        }
 
         oi_now, oi_prev = self.oi_client.get_oi_pair(symbol)
         oi_data = classify_oi_price_context(candles_4h, oi_now, oi_prev, lookback=4)
@@ -1901,6 +1966,29 @@ class SmartMomentumPaperBot:
             sig.score = max(sig.score, min(0.8, sig.score + abs(funding_context["score_bias"]) * 0.5))
             sig.reason = f"{sig.reason}|funding_reversal_alignment"
 
+        if PREDICTIVE_FLOW_ENABLED and sig.side in {"BUY", "SELL"}:
+            flow_aligned = (
+                predictive_flow_15m["bias"] == sig.side
+                or (
+                    predictive_flow_15m["bias"] == "NEUTRAL"
+                    and predictive_flow_1h["bias"] == sig.side
+                )
+            )
+            flow_conflict = (
+                predictive_flow_15m["bias"] not in {"NEUTRAL", sig.side}
+                and predictive_flow_15m["strength"] >= PREDICTIVE_FLOW_MIN_STRENGTH
+            )
+
+            if continuation_context and flow_aligned:
+                sig.score = max(sig.score, min(0.86, sig.score + predictive_flow_15m["score_bias"]))
+                sig.reason = f"{sig.reason}|{predictive_flow_15m['reason']}"
+            elif strong_reversal_context and predictive_flow_15m.get("exhaustion"):
+                sig.score = max(sig.score, min(0.84, sig.score + abs(predictive_flow_15m["score_bias"]) * 0.8))
+                sig.reason = f"{sig.reason}|predictive_flow_exhaustion"
+            elif flow_conflict and not strong_reversal_context:
+                sig.score = max(0.0, sig.score - PREDICTIVE_FLOW_CONFLICT_PENALTY)
+                sig.reason = f"{sig.reason}|predictive_flow_conflict"
+
         volume_confirmed = volume_confirmed_15m or volume_confirmed_4h
         structure_ok = structure_allows_side(structure_4h, sig.side) if sig.side in ("BUY", "SELL") else False
         base_15m_confirmed = bool(base_breakout and base_entry)
@@ -1985,7 +2073,17 @@ class SmartMomentumPaperBot:
             )
             return
 
-        if time.time() < self.cooldown_until.get(symbol, 0):
+        clear_reentry_requirement_if_changed(self.last_stop_meta, symbol, structure_15m)
+
+        reentry_reason = reentry_block_reason(
+            symbol,
+            time.time(),
+            self.cooldown_until,
+            structure_15m,
+            self.last_stop_meta,
+        )
+        if reentry_reason:
+            log_yellow(f"BLOCKED {symbol} | reason={reentry_reason}")
             return
 
         symbol_block_reason = self._symbol_loss_block_reason(symbol)
@@ -1995,7 +2093,7 @@ class SmartMomentumPaperBot:
 
         local_entry_confirmed = any(
             item is not None and item.get("direction") == sig.side
-            for item in [breakout_confirmation, trendline_confirmation, retest_confirmation, fast_move, acceleration]
+            for item in [breakout_confirmation, trendline_confirmation, retest_confirmation]
         )
         specialized_entry_confirmed = (
             (base_breakout is not None and base_entry is not None and base_breakout.get("direction") == sig.side)
@@ -2011,6 +2109,26 @@ class SmartMomentumPaperBot:
 
         if fast_only_entry:
             log_yellow(f"BLOCKED {symbol} | reason=range_c_fast_move_needs_context")
+            return
+
+        if impulse_only:
+            log_yellow(f"BLOCKED {symbol} | reason=impulse_only_setup")
+            return
+
+        signal_conflict = conflict_reason(
+            sig.side,
+            htf_trend=htf_trend,
+            structure_4h=structure_4h,
+            order_block=order_block,
+            continuation_context=continuation_context,
+            strong_reversal_context=strong_reversal_context,
+        )
+        if signal_conflict:
+            log_yellow(f"BLOCKED {symbol} | reason={signal_conflict}")
+            return
+
+        if anchor_count < 1 and sig.signal_class in {"B", "C", "REJECT"}:
+            log_yellow(f"BLOCKED {symbol} | reason=missing_quality_anchor")
             return
 
         if (
@@ -2076,6 +2194,20 @@ class SmartMomentumPaperBot:
                 level_data = None
                 rr_value = 0.0
 
+        min_rr_required = max(
+            2.0,
+            min_rr_for_context(
+                sig.signal_class,
+                symbol_profile=symbol_profile,
+                continuation_context=continuation_context,
+                strong_reversal_context=strong_reversal_context,
+            ),
+        )
+        rr_reason = rr_validation_reason(rr_value, min_rr_required)
+        if sig.side in {"BUY", "SELL"} and rr_reason:
+            log_yellow(f"BLOCKED {symbol} | reason={rr_reason}")
+            return
+
         # если сигнал формально слабый, но RR высокий — разрешаем
         if (
             sig.signal_class == "REJECT"
@@ -2109,6 +2241,28 @@ class SmartMomentumPaperBot:
             order_block_entry=order_block_entry,
             chart_pattern_entry=chart_pattern_entry,
         )
+        anchor_count = quality_anchor_count(
+            retest_confirmation=retest_confirmation,
+            order_block_entry=order_block_entry,
+            liquidity_sweep=liquidity_sweep,
+            divergence_signal=divergence_signal,
+            chart_pattern_entry=chart_pattern_entry,
+            base_entry=base_entry,
+            reversal_entry=reversal_entry,
+        )
+        impulse_only = impulse_only_setup(
+            fast_move=fast_move,
+            acceleration=acceleration,
+            breakout_confirmation=breakout_confirmation,
+            trendline_confirmation=trendline_confirmation,
+            retest_confirmation=retest_confirmation,
+            order_block_entry=order_block_entry,
+            liquidity_sweep=liquidity_sweep,
+            divergence_signal=divergence_signal,
+            chart_pattern_entry=chart_pattern_entry,
+            base_entry=base_entry,
+            reversal_entry=reversal_entry,
+        )
 
         if (
             ANOMALY_WICK_FILTER_ENABLED
@@ -2119,6 +2273,26 @@ class SmartMomentumPaperBot:
         ):
             reason = "anomalous_15m_candle" if anomalous_15m else "anomalous_1h_candle"
             log_yellow(f"BLOCKED {symbol} | reason={reason}")
+            return
+
+        if (
+            PREDICTIVE_FLOW_ENABLED
+            and predictive_flow_15m["bias"] not in {"NEUTRAL", sig.side}
+            and predictive_flow_15m["strength"] >= PREDICTIVE_FLOW_MIN_STRENGTH
+            and sig.signal_class in {"B", "C", "REJECT"}
+            and not strong_reversal_context
+        ):
+            log_yellow(f"BLOCKED {symbol} | reason=predictive_flow_conflict")
+            return
+
+        if (
+            PREDICTIVE_FLOW_ENABLED
+            and continuation_context
+            and predictive_flow_15m["bias"] == "NEUTRAL"
+            and predictive_flow_1h["bias"] not in {"NEUTRAL", sig.side}
+            and sig.signal_class in {"C", "REJECT"}
+        ):
+            log_yellow(f"BLOCKED {symbol} | reason=weak_continuation_without_flow")
             return
 
         if (
@@ -2355,6 +2529,8 @@ class SmartMomentumPaperBot:
                 "btc_bias": btc_regime["bias"],
                 "funding_label": funding_context["label"],
                 "funding_rate": funding_context["rate"],
+                "predictive_flow_bias": predictive_flow_15m["bias"],
+                "predictive_flow_strength": predictive_flow_15m["strength"],
                 "htf_context": "|".join(
                     item for item in [
                         breakout_4h["reason"] if breakout_4h else "",
@@ -2367,6 +2543,7 @@ class SmartMomentumPaperBot:
                         chart_pattern["pattern"] if chart_pattern else "",
                         fast_move_4h["reason"] if fast_move_4h else "",
                         acceleration_4h["reason"] if acceleration_4h else "",
+                        predictive_flow_1h["reason"] if predictive_flow_1h else "",
                     ] if item
                 ),
                 "entry_context": "|".join(
@@ -2380,6 +2557,7 @@ class SmartMomentumPaperBot:
                         chart_pattern_entry["reason"] if chart_pattern_entry else "",
                         fast_move["reason"] if fast_move else "",
                         acceleration["reason"] if acceleration else "",
+                        predictive_flow_15m["reason"] if predictive_flow_15m else "",
                     ] if item
                 ),
             }
@@ -2394,6 +2572,7 @@ class SmartMomentumPaperBot:
                 signal_class=sig.signal_class,
                 strategy_meta=strategy_meta,
                 levels_candles=candles_1h,
+                structure_15m=structure_15m,
             )
 
     def heartbeat(self):
@@ -2420,6 +2599,10 @@ class SmartMomentumPaperBot:
 
         for symbol in active_symbols:
             try:
+                if symbol not in self.symbols:
+                    candles = fetch_klines(symbol, "15m", 200)
+                    if not candles:
+                        continue
                 self.analyze_symbol(symbol)
             except Exception as e:
                 log_red(f"OPEN POSITION CHECK ERROR {symbol}: {e}")

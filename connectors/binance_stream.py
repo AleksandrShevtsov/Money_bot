@@ -71,7 +71,9 @@ class BinanceMarketFeed:
 
     def _prune_old_trades(self, symbol, window_sec=45):
         cutoff = time.time() - window_sec
-        dq = self.trades[symbol]
+        dq = self.trades.get(symbol)
+        if dq is None:
+            return
         while dq and dq[0]["ts"] < cutoff:
             dq.popleft()
 
@@ -124,11 +126,11 @@ class BinanceMarketFeed:
     def get_recent_trades(self, symbol):
         with self._lock:
             self._prune_old_trades(symbol)
-            return list(self.trades[symbol])
+            return list(self.trades.get(symbol, ()))
 
     def get_last_price(self, symbol):
         with self._lock:
-            return self.last_price[symbol]
+            return self.last_price.get(symbol)
 
     def get_orderbook_imbalance(self, symbol):
         with self._lock:
@@ -142,6 +144,8 @@ class BinanceMarketFeed:
         return (bid_qty - ask_qty) / denom
 
     def snapshot(self, symbol):
+        if symbol not in self.trades:
+            return [], None, 0.0
         return (
             self.get_recent_trades(symbol),
             self.get_last_price(symbol),
