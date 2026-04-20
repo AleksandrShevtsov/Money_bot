@@ -43,6 +43,7 @@ from config import (
     TAKE_PROFIT_PCT,
     INVERT_SIGNALS,
     HEARTBEAT_SECONDS,
+    OPEN_POSITIONS_CHECK_SECONDS,
     OPEN_POSITIONS_REPORT_SECONDS,
     MAX_POSITION_DEPOSIT_DRAWDOWN_PCT,
     COOLDOWN_SECONDS,
@@ -53,6 +54,20 @@ from config import (
     MAX_SILENCE_SECONDS,
     ALLOW_REJECT_IF_HIGH_RR,
     HIGH_RR_OVERRIDE_THRESHOLD,
+    MIN_STRONG_SIGNAL_RR,
+    MIN_B_SIGNAL_RR,
+    MIN_BASE_A_RR,
+    MIN_OB_A_RR,
+    MIN_WEAK_REAL_RR,
+    MIN_LOW_CAP_REAL_RR,
+    MAX_WEAK_SIGNAL_ATR_PCT,
+    ENABLE_OB_COUNTER_IMPULSE_BLACKLIST,
+    ENABLE_BASE_COUNTER_IMPULSE_BLACKLIST,
+    ANOMALY_WICK_FILTER_ENABLED,
+    MAX_15M_CANDLE_MOVE_PCT,
+    MAX_1H_CANDLE_MOVE_PCT,
+    MAX_WICK_TO_RANGE_RATIO,
+    MAX_SPIKE_ATR_MULT,
     RSI_DIVERGENCE_ENABLED,
     MACD_DIVERGENCE_ENABLED,
     ENABLE_BASE_BREAKOUT,
@@ -73,6 +88,8 @@ from config import (
     FUNDING_RATE_ENABLED,
     FUNDING_RATE_STRONG_THRESHOLD,
     FUNDING_RATE_EXTREME_THRESHOLD,
+    MAX_SYMBOL_CONSECUTIVE_LOSSES,
+    SYMBOL_LOSS_COOLDOWN_SECONDS,
 )
 from utils import log, log_green, log_red, log_yellow, log_cyan
 from exchange_momentum_scanner import ExchangeMomentumScanner
@@ -128,7 +145,10 @@ class SmartMomentumPaperBot:
         self.positions = {}
         self.cooldown_until = {}
         self.last_signal = {}
+        self.symbol_loss_streaks = {}
         self.last_heartbeat = 0.0
+        self.last_market_scan = 0.0
+        self.last_positions_check = 0.0
         self.last_open_positions_report = 0.0
         self.market_feed = None
         self.oi_client = BybitOIClient(rest_base=BYBIT_REST_BASE)
@@ -209,6 +229,246 @@ class SmartMomentumPaperBot:
         except Exception as e:
             log_yellow(f"DETECT FAIL {label} | error={e}")
             return default
+
+    def _has_two_opposite_impulse_candles(self, candles, position_side: str) -> bool:
+        if not candles or len(candles) < 10:
+            return False
+
+        recent = candles[-2:]
+        baseline = candles[-10:-2]
+        avg_body = sum(abs(c["close"] - c["open"]) for c in baseline) / max(1, len(baseline))
+        avg_range = sum(abs(c["high"] - c["low"]) for c in baseline) / max(1, len(baseline))
+
+        if avg_body <= 0:
+            avg_body = 1e-12
+        if avg_range <= 0:
+            avg_range = 1e-12
+
+        expected_bearish = position_side == "BUY"
+        for candle in recent:
+            is_bearish = candle["close"] < candle["open"]
+            body = abs(candle["close"] - candle["open"])
+            candle_range = abs(candle["high"] - candle["low"])
+            if is_bearish != expected_bearish:
+                return False
+            if body < avg_body * 1.1 and candle_range < avg_range * 1.1:
+                return False
+
+        return True
+
+    def _reverse_signal_confirmed(
+        self,
+        pos,
+        signal_side,
+        structure_15m=None,
+        candles_15m=None,
+        orderflow_bias=0.0,
+        oi_bias=0.0,
+    ):
+        if pos["side"] == "BUY" and signal_side != "SELL":
+            return False
+        if pos["side"] == "SELL" and signal_side != "BUY":
+            return False
+
+        structure_break = bool(
+            (pos["side"] == "BUY" and structure_15m and structure_15m.get("trend") == "bearish_structure")
+            or (pos["side"] == "SELL" and structure_15m and structure_15m.get("trend") == "bullish_structure")
+        )
+        adverse_flow = self.exit_manager.should_exit_on_adverse_flow(
+            pos,
+            orderflow_bias=orderflow_bias,
+            oi_bias=oi_bias,
+        )
+        opposite_impulse = self._has_two_opposite_impulse_candles(candles_15m, pos["side"])
+        return structure_break or adverse_flow or opposite_impulse
+
+    def _has_local_counter_pressure(self, side, *signals) -> bool:
+        for signal in signals:
+            if signal is None:
+                continue
+            direction = signal.get("direction")
+            if direction in {"BUY", "SELL"} and direction != side:
+                return True
+        return False
+
+    def _blacklisted_context(self, signal_class, side, htf_context, entry_context) -> str | None:
+        htf_text = str(htf_context or "")
+        entry_text = str(entry_context or "")
+        merged = f"{htf_text}|{entry_text}"
+
+        if ENABLE_OB_COUNTER_IMPULSE_BLACKLIST and signal_class == "OB_A":
+            if side == "SELL" and "fast_up_move" in merged:
+                return "ob_a_fast_up_move_against_short"
+            if side == "BUY" and "fast_down_move" in merged:
+                return "ob_a_fast_down_move_against_long"
+
+        if ENABLE_BASE_COUNTER_IMPULSE_BLACKLIST and signal_class == "BASE_A":
+            if side == "SELL" and ("fast_up_move" in merged or "price_acceleration_up" in merged):
+                return "base_a_counter_impulse_against_short"
+            if side == "BUY" and ("fast_down_move" in merged or "price_acceleration_down" in merged):
+                return "base_a_counter_impulse_against_long"
+
+        return None
+
+    def _strong_order_block_exception(
+        self,
+        signal_class,
+        strong_reversal_context=False,
+        divergence_signal=None,
+        liquidity_sweep=None,
+        chart_pattern_entry=None,
+    ) -> bool:
+        if not strong_reversal_context:
+            return False
+        if signal_class not in {"REVERSAL_A", "REVERSAL_DIV"}:
+            return False
+        return any(item is not None for item in (divergence_signal, liquidity_sweep, chart_pattern_entry))
+
+    def _symbol_loss_block_reason(self, symbol: str) -> str | None:
+        losses = int(self.symbol_loss_streaks.get(symbol, 0) or 0)
+        if MAX_SYMBOL_CONSECUTIVE_LOSSES > 0 and losses >= MAX_SYMBOL_CONSECUTIVE_LOSSES:
+            return f"symbol_loss_streak_blocked({losses})"
+        return None
+
+    def _entry_has_quality_anchor(
+        self,
+        retest_confirmation=None,
+        order_block=None,
+        liquidity_sweep=None,
+        divergence_signal=None,
+        chart_pattern=None,
+        base_entry=None,
+        reversal_entry=None,
+        order_block_entry=None,
+        chart_pattern_entry=None,
+    ) -> bool:
+        return any(
+            item is not None
+            for item in (
+                retest_confirmation,
+                order_block,
+                liquidity_sweep,
+                divergence_signal,
+                chart_pattern,
+                base_entry,
+                reversal_entry,
+                order_block_entry,
+                chart_pattern_entry,
+            )
+        )
+
+    def _real_mode_entry_block_reason(
+        self,
+        *,
+        signal_class,
+        symbol_profile,
+        rr_value,
+        high_rr_trade,
+        continuation_context,
+        strong_signal_class,
+        strong_reversal_context,
+        local_counter_pressure,
+        level_data,
+        quality_anchor,
+    ) -> str | None:
+        if EXECUTION_MODE != "real":
+            return None
+
+        if signal_class == "REJECT" and not high_rr_trade:
+            return "real_mode_reject_blocked"
+
+        if signal_class == "C" and symbol_profile == "LOW_CAP" and not high_rr_trade:
+            return "real_mode_low_cap_c_blocked"
+
+        if (
+            signal_class == "C"
+            and symbol_profile == "ALT"
+            and continuation_context
+            and not quality_anchor
+            and not high_rr_trade
+        ):
+            return "real_mode_alt_c_needs_anchor"
+
+        if (
+            signal_class in {"C", "REJECT"}
+            and symbol_profile in {"ALT", "LOW_CAP"}
+            and (not level_data or level_data.get("source") != "levels")
+            and not high_rr_trade
+        ):
+            return "real_mode_weak_needs_structural_levels"
+
+        if (
+            symbol_profile == "LOW_CAP"
+            and continuation_context
+            and not strong_signal_class
+            and not strong_reversal_context
+            and local_counter_pressure
+            and not high_rr_trade
+        ):
+            return "real_mode_low_cap_counter_pressure"
+
+        if (
+            signal_class in {"C", "REJECT"}
+            and rr_value > 0
+            and rr_value < max(MIN_WEAK_REAL_RR, HIGH_RR_OVERRIDE_THRESHOLD * 0.8)
+            and not quality_anchor
+        ):
+            return "real_mode_weak_low_rr"
+
+        if (
+            symbol_profile == "LOW_CAP"
+            and rr_value > 0
+            and rr_value < MIN_LOW_CAP_REAL_RR
+            and not strong_signal_class
+            and not high_rr_trade
+        ):
+            return "real_mode_low_cap_low_rr"
+
+        return None
+
+    def _apply_real_safety_defaults(self, balance: float):
+        # Автолимиты на день отключены: бот должен работать постоянно.
+        # Ограничения применяются только если они явно заданы через config/.env.
+        return
+
+    def _candle_move_pct(self, candle):
+        open_price = float(candle.get("open", 0.0) or 0.0)
+        close_price = float(candle.get("close", open_price) or open_price)
+        if open_price <= 0:
+            return 0.0
+        return abs(close_price - open_price) / open_price
+
+    def _wick_range_ratio(self, candle):
+        high = float(candle.get("high", 0.0) or 0.0)
+        low = float(candle.get("low", 0.0) or 0.0)
+        open_price = float(candle.get("open", 0.0) or 0.0)
+        close_price = float(candle.get("close", open_price) or open_price)
+        candle_range = max(0.0, high - low)
+        if candle_range <= 0:
+            return 0.0
+        body_high = max(open_price, close_price)
+        body_low = min(open_price, close_price)
+        upper_wick = max(0.0, high - body_high)
+        lower_wick = max(0.0, body_low - low)
+        return max(upper_wick, lower_wick) / candle_range
+
+    def _has_anomalous_candle(self, candles, max_move_pct, atr_pct_value):
+        if not candles:
+            return False
+        recent = candles[-3:]
+        for candle in recent:
+            move_pct = self._candle_move_pct(candle)
+            wick_ratio = self._wick_range_ratio(candle)
+            range_pct = 0.0
+            low = float(candle.get("low", 0.0) or 0.0)
+            high = float(candle.get("high", 0.0) or 0.0)
+            if low > 0:
+                range_pct = max(0.0, high - low) / low
+            if move_pct >= max_move_pct:
+                return True
+            if wick_ratio >= MAX_WICK_TO_RANGE_RATIO and atr_pct_value > 0 and range_pct >= atr_pct_value * MAX_SPIKE_ATR_MULT:
+                return True
+        return False
 
     def _fmt_money(self, value):
         try:
@@ -316,6 +576,8 @@ class SmartMomentumPaperBot:
         chart_pattern_entry=None,
         regime_name="range_day",
         symbol_profile="ALT",
+        quality_anchor=False,
+        continuation_context=False,
     ):
         normalized = signal_class
         reasons = []
@@ -331,15 +593,23 @@ class SmartMomentumPaperBot:
             ]
         )
 
-        if normalized == "REJECT" and score >= 0.72 and (strong_reversal_context or confirmed_entry):
+        if normalized == "REJECT" and score >= 0.72 and (strong_reversal_context or confirmed_entry or quality_anchor):
             normalized = "B"
             reasons.append("score_class_sync_reject_up")
-        elif normalized == "C" and score >= 0.68 and (strong_reversal_context or confirmed_entry):
+        elif normalized == "C" and score >= 0.68 and (strong_reversal_context or confirmed_entry or quality_anchor):
             normalized = "B"
             reasons.append("score_class_sync_up")
         elif normalized == "B" and score < 0.32 and not strong_reversal_context and retest_confirmation is None:
             normalized = "C"
             reasons.append("score_class_sync_down")
+
+        if normalized == "B" and score < 0.42 and not (quality_anchor or strong_reversal_context):
+            normalized = "C"
+            reasons.append("score_class_sync_b_needs_anchor")
+
+        if normalized == "C" and continuation_context and not (quality_anchor or retest_confirmation or strong_reversal_context):
+            normalized = "REJECT"
+            reasons.append("score_class_sync_weak_continuation_reject")
 
         if symbol_profile == "LOW_CAP" and regime_name == "high_volatility_panic" and normalized == "B" and not strong_reversal_context:
             normalized = "C"
@@ -486,6 +756,7 @@ class SmartMomentumPaperBot:
                 "positions": self.serialize_positions(),
                 "cooldown_until": self.cooldown_until,
                 "last_signal": self.last_signal,
+                "symbol_loss_streaks": self.symbol_loss_streaks,
                 "risk_guard": self.risk_guard.snapshot(),
             }
         )
@@ -505,6 +776,7 @@ class SmartMomentumPaperBot:
                 self.positions[symbol] = hydrated
         self.cooldown_until = state.get("cooldown_until", {}) or {}
         self.last_signal = state.get("last_signal", {}) or {}
+        self.symbol_loss_streaks = state.get("symbol_loss_streaks", {}) or {}
         self.risk_guard.hydrate(state.get("risk_guard", {}) or {})
         self.risk_guard.initialize_balance(self.balance)
 
@@ -921,8 +1193,22 @@ class SmartMomentumPaperBot:
 
         self.positions[symbol] = None
 
+        if pnl < 0:
+            self.symbol_loss_streaks[symbol] = int(self.symbol_loss_streaks.get(symbol, 0) or 0) + 1
+        else:
+            self.symbol_loss_streaks[symbol] = 0
+
         if reason == "stop_loss":
             self.cooldown_until[symbol] = time.time() + STOPLOSS_COOLDOWN_SECONDS
+            if (
+                pnl < 0
+                and MAX_SYMBOL_CONSECUTIVE_LOSSES > 0
+                and self.symbol_loss_streaks.get(symbol, 0) >= MAX_SYMBOL_CONSECUTIVE_LOSSES
+            ):
+                self.cooldown_until[symbol] = max(
+                    self.cooldown_until.get(symbol, 0),
+                    time.time() + SYMBOL_LOSS_COOLDOWN_SECONDS,
+                )
         else:
             self.cooldown_until[symbol] = time.time() + COOLDOWN_SECONDS
 
@@ -935,7 +1221,7 @@ class SmartMomentumPaperBot:
         if pos is None or pos.get("partial_done"):
             return
 
-        fraction = self.exit_manager.get_partial_fraction()
+        fraction = self.exit_manager.get_partial_fraction(pos)
 
         qty_close = pos["qty"] * fraction
         qty_left = pos["qty"] - qty_close
@@ -999,7 +1285,16 @@ class SmartMomentumPaperBot:
 
         self.save_runtime_state()
 
-    def manage_position(self, symbol, current_price, signal_side, orderflow_bias=0.0, oi_bias=0.0):
+    def manage_position(
+        self,
+        symbol,
+        current_price,
+        signal_side,
+        orderflow_bias=0.0,
+        oi_bias=0.0,
+        structure_15m=None,
+        candles_15m=None,
+    ):
         pos = self.positions.get(symbol)
         if pos is None or current_price is None:
             return
@@ -1088,10 +1383,14 @@ class SmartMomentumPaperBot:
 
         # reverse signal закрывает только слабые сделки
         if pos.get("signal_class") in {"C", "REJECT"}:
-            if pos["side"] == "BUY" and signal_side == "SELL":
-                self.close_position(symbol, current_price, "reverse_signal")
-                return
-            if pos["side"] == "SELL" and signal_side == "BUY":
+            if self._reverse_signal_confirmed(
+                pos,
+                signal_side,
+                structure_15m=structure_15m,
+                candles_15m=candles_15m,
+                orderflow_bias=orderflow_bias,
+                oi_bias=oi_bias,
+            ):
                 self.close_position(symbol, current_price, "reverse_signal")
                 return
 
@@ -1177,6 +1476,16 @@ class SmartMomentumPaperBot:
         volume_confirmed_15m, last_vol, avg_vol = breakout_volume_confirms(candles)
         regime_4h = market_regime(candles_4h)
         regime_name = regime_4h.get("name", "range_day")
+        anomalous_15m = self._has_anomalous_candle(
+            candles,
+            max_move_pct=MAX_15M_CANDLE_MOVE_PCT,
+            atr_pct_value=float(regime_4h.get("atr_pct", 0.0) or 0.0),
+        )
+        anomalous_1h = self._has_anomalous_candle(
+            candles_1h,
+            max_move_pct=MAX_1H_CANDLE_MOVE_PCT,
+            atr_pct_value=float(regime_4h.get("atr_pct", 0.0) or 0.0),
+        )
         btc_regime = self._safe_detect("btc_regime", detect_btc_regime, default=None) if ENABLE_BTC_REGIME_FILTER else {
             "regime": "disabled",
             "bias": "NEUTRAL",
@@ -1545,6 +1854,19 @@ class SmartMomentumPaperBot:
                 "inverse_cup_and_handle",
             })
         )
+        pre_quality_anchor = any(
+            item is not None for item in [
+                retest_confirmation,
+                order_block,
+                liquidity_sweep,
+                divergence_signal,
+                chart_pattern,
+                base_entry,
+                reversal_entry,
+                order_block_entry,
+                chart_pattern_entry,
+            ]
+        )
 
         # мягкий HTF penalty
         if htf_trend == "BULL" and sig.side == "SELL":
@@ -1621,11 +1943,27 @@ class SmartMomentumPaperBot:
             chart_pattern_entry=chart_pattern_entry,
             regime_name=regime_name,
             symbol_profile=symbol_profile,
+            quality_anchor=pre_quality_anchor,
+            continuation_context=continuation_context,
         )
         quality_reasons.extend(sync_reasons)
 
         sig.signal_class = signal_class
         sig.reason = f"{sig.reason}|class={signal_class}|q={','.join(quality_reasons)}"
+
+        range_like_regime = regime_name in {"range", "range_day"}
+        context_entry_present = any(
+            item is not None
+            for item in [retest_confirmation, order_block_entry, liquidity_sweep, divergence_signal, chart_pattern_entry]
+        )
+        fast_only_entry = (
+            sig.signal_class == "C"
+            and range_like_regime
+            and (fast_move is not None or acceleration is not None)
+            and breakout_confirmation is None
+            and trendline_confirmation is None
+            and not context_entry_present
+        )
 
         if self.last_signal.get(symbol) != sig.side:
             log(
@@ -1636,10 +1974,23 @@ class SmartMomentumPaperBot:
             self.last_signal[symbol] = sig.side
 
         if self.positions.get(symbol) is not None:
-            self.manage_position(symbol, current_price, sig.side)
+            self.manage_position(
+                symbol,
+                current_price,
+                sig.side,
+                orderflow_bias=imbalance,
+                oi_bias=float(oi_data.get("score_bias", 0.0) or 0.0),
+                structure_15m=structure_15m,
+                candles_15m=candles,
+            )
             return
 
         if time.time() < self.cooldown_until.get(symbol, 0):
+            return
+
+        symbol_block_reason = self._symbol_loss_block_reason(symbol)
+        if symbol_block_reason:
+            log_yellow(f"BLOCKED {symbol} | reason={symbol_block_reason}")
             return
 
         local_entry_confirmed = any(
@@ -1656,6 +2007,19 @@ class SmartMomentumPaperBot:
 
         if sig.side in {"BUY", "SELL"} and not (local_entry_confirmed or specialized_entry_confirmed):
             log_yellow(f"BLOCKED {symbol} | reason=no_15m_entry_confirmation")
+            return
+
+        if fast_only_entry:
+            log_yellow(f"BLOCKED {symbol} | reason=range_c_fast_move_needs_context")
+            return
+
+        if (
+            sig.signal_class in {"C", "REJECT"}
+            and continuation_context
+            and regime_name in {"range", "range_day", "squeeze"}
+            and not context_entry_present
+        ):
+            log_yellow(f"BLOCKED {symbol} | reason=weak_continuation_without_anchor")
             return
 
         # дешёвые монеты: нужен хотя бы retest или сильный RR
@@ -1727,14 +2091,147 @@ class SmartMomentumPaperBot:
         strong_signal_class = self._is_strong_signal_class(sig.signal_class)
         weak_signal_class = sig.signal_class in {"C", "REJECT"}
         high_rr_trade = rr_value >= HIGH_RR_OVERRIDE_THRESHOLD
+        local_counter_pressure = self._has_local_counter_pressure(
+            sig.side,
+            breakout_confirmation,
+            trendline_confirmation,
+            fast_move,
+            acceleration,
+        )
+        quality_anchor = self._entry_has_quality_anchor(
+            retest_confirmation=retest_confirmation,
+            order_block=order_block,
+            liquidity_sweep=liquidity_sweep,
+            divergence_signal=divergence_signal,
+            chart_pattern=chart_pattern,
+            base_entry=base_entry,
+            reversal_entry=reversal_entry,
+            order_block_entry=order_block_entry,
+            chart_pattern_entry=chart_pattern_entry,
+        )
 
-        if order_block and order_block.get("direction") != sig.side and not strong_reversal_context:
-            if order_block.get("pattern") == "bullish_order_block" and sig.side == "SELL":
+        if (
+            ANOMALY_WICK_FILTER_ENABLED
+            and (anomalous_15m or anomalous_1h)
+            and symbol_profile in {"ALT", "LOW_CAP"}
+            and sig.signal_class not in {"BASE_A", "PATTERN_A", "REVERSAL_A", "REVERSAL_DIV"}
+            and not high_rr_trade
+        ):
+            reason = "anomalous_15m_candle" if anomalous_15m else "anomalous_1h_candle"
+            log_yellow(f"BLOCKED {symbol} | reason={reason}")
+            return
+
+        if (
+            strong_signal_class
+            and rr_value > 0
+            and rr_value < MIN_STRONG_SIGNAL_RR
+            and not high_rr_trade
+        ):
+            log_yellow(f"BLOCKED {symbol} | reason=strong_signal_low_rr | rr={rr_value:.2f}")
+            return
+
+        if sig.signal_class == "B" and rr_value > 0 and rr_value < MIN_B_SIGNAL_RR and not high_rr_trade:
+            log_yellow(f"BLOCKED {symbol} | reason=b_signal_low_rr | rr={rr_value:.2f}")
+            return
+
+        if sig.signal_class == "BASE_A" and rr_value > 0 and rr_value < MIN_BASE_A_RR and not high_rr_trade:
+            log_yellow(f"BLOCKED {symbol} | reason=base_a_low_rr | rr={rr_value:.2f}")
+            return
+
+        if sig.signal_class == "OB_A" and rr_value > 0 and rr_value < MIN_OB_A_RR and not high_rr_trade:
+            log_yellow(f"BLOCKED {symbol} | reason=ob_a_low_rr | rr={rr_value:.2f}")
+            return
+
+        if (
+            weak_signal_class
+            and float(regime_4h.get("atr_pct", 0.0) or 0.0) >= MAX_WEAK_SIGNAL_ATR_PCT
+            and symbol_profile in {"ALT", "LOW_CAP"}
+            and not strong_reversal_context
+        ):
+            log_yellow(
+                f"BLOCKED {symbol} | reason=weak_signal_high_atr | atr_pct={float(regime_4h.get('atr_pct', 0.0) or 0.0):.4f}"
+            )
+            return
+
+        if order_block and order_block.get("direction") != sig.side:
+            strong_order_block_exception = self._strong_order_block_exception(
+                sig.signal_class,
+                strong_reversal_context=strong_reversal_context,
+                divergence_signal=divergence_signal,
+                liquidity_sweep=liquidity_sweep,
+                chart_pattern_entry=chart_pattern_entry,
+            )
+            if order_block.get("pattern") == "bullish_order_block" and sig.side == "SELL" and not strong_order_block_exception:
                 log_yellow(f"BLOCKED {symbol} | reason=against_bullish_order_block")
                 return
-            if order_block.get("pattern") == "bearish_order_block" and sig.side == "BUY":
+            if order_block.get("pattern") == "bearish_order_block" and sig.side == "BUY" and not strong_order_block_exception:
                 log_yellow(f"BLOCKED {symbol} | reason=against_bearish_order_block")
                 return
+
+        if (
+            sig.signal_class in {"C", "REJECT"}
+            and symbol_profile in {"ALT", "LOW_CAP"}
+            and not quality_anchor
+            and rr_value < HIGH_RR_OVERRIDE_THRESHOLD
+        ):
+            log_yellow(f"BLOCKED {symbol} | reason=weak_signal_needs_quality_anchor")
+            return
+
+        if (
+            order_block_entry
+            and local_counter_pressure
+            and not divergence_signal
+            and not chart_pattern_entry
+            and not high_rr_trade
+        ):
+            log_yellow(f"BLOCKED {symbol} | reason=order_block_against_local_impulse")
+            return
+
+        if (
+            strong_reversal_context
+            and local_counter_pressure
+            and not reversal_entry
+            and not divergence_signal
+            and not chart_pattern_entry
+            and not high_rr_trade
+        ):
+            log_yellow(f"BLOCKED {symbol} | reason=reversal_without_local_turn")
+            return
+
+        blacklist_reason = self._blacklisted_context(
+            sig.signal_class,
+            sig.side,
+            "|".join(
+                item for item in [
+                    breakout_4h["reason"] if breakout_4h else "",
+                    trendline_4h["reason"] if trendline_4h else "",
+                    retest_4h["reason"] if retest_4h else "",
+                    base_breakout["pattern"] if base_breakout else "",
+                    htf_reversal["pattern"] if htf_reversal else "",
+                    divergence_signal["reason"] if divergence_signal else "",
+                    order_block["pattern"] if order_block else "",
+                    chart_pattern["pattern"] if chart_pattern else "",
+                    fast_move_4h["reason"] if fast_move_4h else "",
+                    acceleration_4h["reason"] if acceleration_4h else "",
+                ] if item
+            ),
+            "|".join(
+                item for item in [
+                    breakout_confirmation["reason"] if breakout_confirmation else "",
+                    trendline_confirmation["reason"] if trendline_confirmation else "",
+                    retest_confirmation["reason"] if retest_confirmation else "",
+                    base_entry["reason"] if base_entry else "",
+                    reversal_entry["reason"] if reversal_entry else "",
+                    order_block_entry["reason"] if order_block_entry else "",
+                    chart_pattern_entry["reason"] if chart_pattern_entry else "",
+                    fast_move["reason"] if fast_move else "",
+                    acceleration["reason"] if acceleration else "",
+                ] if item
+            ),
+        )
+        if blacklist_reason:
+            log_yellow(f"BLOCKED {symbol} | reason={blacklist_reason}")
+            return
 
         if btc_regime["bias"] == "BUY" and sig.side == "SELL" and not strong_reversal_context and rr_value < HIGH_RR_OVERRIDE_THRESHOLD:
             log_yellow(f"BLOCKED {symbol} | reason=btc_bullish_conflict")
@@ -1788,6 +2285,22 @@ class SmartMomentumPaperBot:
             and not high_rr_trade
         ):
             log_yellow(f"BLOCKED {symbol} | reason=low_cap_needs_structural_levels")
+            return
+
+        real_mode_block_reason = self._real_mode_entry_block_reason(
+            signal_class=sig.signal_class,
+            symbol_profile=symbol_profile,
+            rr_value=rr_value,
+            high_rr_trade=high_rr_trade,
+            continuation_context=continuation_context,
+            strong_signal_class=strong_signal_class,
+            strong_reversal_context=strong_reversal_context,
+            local_counter_pressure=local_counter_pressure,
+            level_data=level_data,
+            quality_anchor=quality_anchor,
+        )
+        if real_mode_block_reason:
+            log_yellow(f"BLOCKED {symbol} | reason={real_mode_block_reason}")
             return
 
         # breakout без объема разрешаем только если есть retest или RR очень высокий
@@ -1900,24 +2413,43 @@ class SmartMomentumPaperBot:
             self.last_open_positions_report = time.time()
         self.save_runtime_state()
 
+    def check_open_positions(self):
+        active_symbols = [symbol for symbol, pos in self.positions.items() if pos is not None]
+        if not active_symbols:
+            return
+
+        for symbol in active_symbols:
+            try:
+                self.analyze_symbol(symbol)
+            except Exception as e:
+                log_red(f"OPEN POSITION CHECK ERROR {symbol}: {e}")
+
     def run(self):
         log("Smart Momentum Paper Bot started")
 
         while True:
             try:
-                self.update_symbols()
+                now = time.time()
 
-                for symbol in self.symbols:
-                    try:
-                        self.analyze_symbol(symbol)
-                    except Exception as e:
-                        log_red(f"ERROR {symbol}: {e}")
+                if now - self.last_positions_check >= OPEN_POSITIONS_CHECK_SECONDS:
+                    self.check_open_positions()
+                    self.last_positions_check = now
 
-                if time.time() - self.last_heartbeat > HEARTBEAT_SECONDS:
+                if not self.symbols or now - self.last_market_scan >= SCAN_INTERVAL_SECONDS:
+                    self.update_symbols()
+
+                    for symbol in self.symbols:
+                        try:
+                            self.analyze_symbol(symbol)
+                        except Exception as e:
+                            log_red(f"ERROR {symbol}: {e}")
+                    self.last_market_scan = now
+
+                if now - self.last_heartbeat > HEARTBEAT_SECONDS:
                     self.heartbeat()
-                    self.last_heartbeat = time.time()
+                    self.last_heartbeat = now
 
-                time.sleep(SCAN_INTERVAL_SECONDS)
+                time.sleep(1)
 
             except KeyboardInterrupt:
                 raise

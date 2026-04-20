@@ -1,20 +1,107 @@
 class SmartExitManager:
     def __init__(self):
-        self.partial_tp_trigger = 0.50
-        self.partial_close_fraction = 0.50
-        self.trail_trigger = 0.85
-        self.trail_gap_pct = 0.006
-        self.atr_trail_mult = 1.6
-        self.stop_lock_steps = (
-            (0.30, 0.10),
-            (0.50, 0.20),
-        )
+        self.default_profile = {
+            "partial_tp_trigger": 0.50,
+            "partial_close_fraction": 0.50,
+            "trail_trigger": 0.85,
+            "trail_gap_pct": 0.006,
+            "atr_trail_mult": 1.6,
+            "profit_be_partial_trigger": 0.50,
+            "stop_lock_steps": (
+                (0.30, 0.10),
+                (0.50, 0.20),
+            ),
+        }
+        self.class_profiles = {
+            "BASE_A": {
+                "partial_tp_trigger": 0.62,
+                "partial_close_fraction": 0.35,
+                "trail_trigger": 0.95,
+                "profit_be_partial_trigger": 0.62,
+                "stop_lock_steps": (
+                    (0.35, 0.10),
+                    (0.62, 0.25),
+                ),
+            },
+            "PATTERN_A": {
+                "partial_tp_trigger": 0.60,
+                "partial_close_fraction": 0.35,
+                "trail_trigger": 0.93,
+                "profit_be_partial_trigger": 0.60,
+                "stop_lock_steps": (
+                    (0.35, 0.10),
+                    (0.60, 0.22),
+                ),
+            },
+            "OB_A": {
+                "partial_tp_trigger": 0.55,
+                "partial_close_fraction": 0.45,
+                "trail_trigger": 0.88,
+                "profit_be_partial_trigger": 0.55,
+                "stop_lock_steps": (
+                    (0.32, 0.10),
+                    (0.55, 0.22),
+                ),
+            },
+            "REVERSAL_A": {
+                "partial_tp_trigger": 0.58,
+                "partial_close_fraction": 0.40,
+                "trail_trigger": 0.90,
+                "profit_be_partial_trigger": 0.58,
+                "stop_lock_steps": (
+                    (0.35, 0.10),
+                    (0.58, 0.22),
+                ),
+            },
+            "REVERSAL_DIV": {
+                "partial_tp_trigger": 0.55,
+                "partial_close_fraction": 0.45,
+                "trail_trigger": 0.88,
+                "profit_be_partial_trigger": 0.55,
+                "stop_lock_steps": (
+                    (0.32, 0.10),
+                    (0.55, 0.20),
+                ),
+            },
+            "A": {
+                "partial_tp_trigger": 0.55,
+                "partial_close_fraction": 0.45,
+                "trail_trigger": 0.88,
+                "profit_be_partial_trigger": 0.55,
+            },
+            "B": {
+                "partial_tp_trigger": 0.48,
+                "partial_close_fraction": 0.50,
+                "trail_trigger": 0.82,
+                "profit_be_partial_trigger": 0.48,
+            },
+            "C": {
+                "partial_tp_trigger": 0.30,
+                "partial_close_fraction": 0.65,
+                "trail_trigger": 0.62,
+                "trail_gap_pct": 0.005,
+                "profit_be_partial_trigger": 0.30,
+                "stop_lock_steps": (
+                    (0.20, 0.05),
+                    (0.30, 0.12),
+                ),
+            },
+            "REJECT": {
+                "partial_tp_trigger": 0.24,
+                "partial_close_fraction": 0.75,
+                "trail_trigger": 0.52,
+                "trail_gap_pct": 0.0045,
+                "profit_be_partial_trigger": 0.24,
+                "stop_lock_steps": (
+                    (0.18, 0.03),
+                    (0.24, 0.08),
+                ),
+            },
+        }
 
         self.min_hold_seconds = 180
-        self.strong_hold_seconds = 900
+        self.strong_hold_seconds = 1200
         self.strong_signal_score = 0.85
-
-        self.profit_be_partial_trigger = 0.50
 
         # Главная правка: не душим сделки слишком рано.
         # 15m стратегия не должна закрываться через 2–3 минуты.
@@ -23,6 +110,12 @@ class SmartExitManager:
         self.early_exit_check_seconds_reject = 15 * 60
         self.early_exit_min_progress_c = 0.08
         self.early_exit_min_progress_reject = 0.05
+
+    def _profile(self, pos):
+        signal_class = pos.get("signal_class", "REJECT")
+        profile = dict(self.default_profile)
+        profile.update(self.class_profiles.get(signal_class, {}))
+        return profile
 
     def progress_to_take(self, pos, price):
         entry = pos["entry"]
@@ -60,7 +153,7 @@ class SmartExitManager:
     def should_be_and_partial_on_profit(self, pos, price):
         if pos.get("partial_done"):
             return False
-        return self.reward_progress(pos, price) >= self.profit_be_partial_trigger
+        return self.reward_progress(pos, price) >= self._profile(pos)["profit_be_partial_trigger"]
 
     def apply_break_even(self, pos):
         old_stop = pos["stop"]
@@ -76,9 +169,10 @@ class SmartExitManager:
     def get_stop_lock_target(self, pos, price):
         progress = self.reward_progress(pos, price)
         current_stage = float(pos.get("stop_lock_stage", 0.0) or 0.0)
+        stop_lock_steps = self._profile(pos)["stop_lock_steps"]
 
         best_stage = None
-        for trigger_progress, lock_progress in self.stop_lock_steps:
+        for trigger_progress, lock_progress in stop_lock_steps:
             if progress >= trigger_progress and lock_progress > current_stage:
                 best_stage = lock_progress
 
@@ -109,20 +203,23 @@ class SmartExitManager:
                 return True
             if pos["side"] == "SELL" and price <= tp1:
                 return True
-        return self.reward_progress(pos, price) >= self.partial_tp_trigger
+        return self.reward_progress(pos, price) >= self._profile(pos)["partial_tp_trigger"]
 
-    def get_partial_fraction(self):
-        return self.partial_close_fraction
+    def get_partial_fraction(self, pos=None):
+        if pos is None:
+            return self.default_profile["partial_close_fraction"]
+        return self._profile(pos)["partial_close_fraction"]
 
     def should_activate_trailing(self, pos, price):
         # trail только после частичного закрытия или почти у цели
         if not pos.get("partial_done"):
             return False
-        return self.progress_to_take(pos, price) >= self.trail_trigger
+        return self.progress_to_take(pos, price) >= self._profile(pos)["trail_trigger"]
 
     def apply_trailing(self, pos, price):
         old_stop = pos["stop"]
-        atr_gap_pct = max(self.trail_gap_pct, float(pos.get("atr_pct", 0.0)) * self.atr_trail_mult)
+        profile = self._profile(pos)
+        atr_gap_pct = max(profile["trail_gap_pct"], float(pos.get("atr_pct", 0.0)) * profile["atr_trail_mult"])
 
         if pos["side"] == "BUY":
             new_stop = price * (1 - atr_gap_pct)

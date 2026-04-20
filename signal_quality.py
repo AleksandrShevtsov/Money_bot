@@ -89,10 +89,24 @@ def classify_signal_quality(
     if retest_confirmation and volume_confirmed and structure_ok and strong_htf and multi_bar_confirmed and score >= 0.40:
         return "A", reasons
 
-    if (breakout_confirmation or trendline_confirmation) and structure_ok and multi_bar_confirmed and score >= 0.32:
+    if (
+        (breakout_confirmation or trendline_confirmation)
+        and structure_ok
+        and (multi_bar_confirmed or retest_confirmation or volume_confirmed)
+        and score >= 0.36
+    ):
         return "B", reasons
 
-    if (fast_move or acceleration or liquidity_sweep) and score >= 0.28:
+    if (
+        (
+            liquidity_sweep
+            or (fast_move and acceleration)
+            or retest_confirmation
+            or order_block_confirmed
+            or chart_pattern_confirmed
+        )
+        and score >= 0.32
+    ):
         return "C", reasons
 
     return "REJECT", reasons

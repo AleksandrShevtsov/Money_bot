@@ -61,10 +61,19 @@ class PositionManager:
 
     def _risk_cap_pct(self, symbol_profile, signal_class):
         if symbol_profile == "CORE":
-            return CORE_MAX_RISK_PCT
-        if symbol_profile == "LOW_CAP":
-            return LOW_CAP_MAX_RISK_PCT
-        return ALT_MAX_RISK_PCT
+            base_cap = CORE_MAX_RISK_PCT
+        elif symbol_profile == "LOW_CAP":
+            base_cap = LOW_CAP_MAX_RISK_PCT
+        else:
+            base_cap = ALT_MAX_RISK_PCT
+
+        if signal_class in {"A", "BASE_A", "REVERSAL_A", "REVERSAL_DIV", "OB_A", "PATTERN_A"}:
+            return base_cap
+        if signal_class == "B":
+            return base_cap * 0.75
+        if signal_class == "C":
+            return base_cap * 0.45
+        return base_cap * 0.20
 
     def build_position(
         self,
